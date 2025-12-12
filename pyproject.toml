@@ -15,6 +15,10 @@ dependencies = [
     "numpy>=2.0.2",
     "python-dotenv",
     "sentence-transformers>=5.1.2",
+    "aiohttp>=3.9.0",
+    "websockets>=12.0",
+    "openai>=1.0.0",
+    "google-cloud-texttospeech>=2.14.0",
 ]
 
 [dependency-groups]

@@ -11,3 +11,4 @@ KMS
 .pytest_cache
 .ruff_cache
 google_credentials_file.json
+venv/
