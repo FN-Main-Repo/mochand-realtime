@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from google.cloud import texttospeech
 import wave
+from langdetect import detect, LangDetectException
 
 load_dotenv(".env.local")
 
@@ -51,44 +52,14 @@ class LiveKitPipeline:
         )
         
         # Conversation history
+        # Conversation history
         self.messages = [
             {
                 "role": "system",
                 "content": """You are Jarvis, an intelligent AI assistant in a professional Google Meet call.
                 
-                RESPONSE FORMAT (CRITICAL):
-                You MUST respond in valid JSON format:
-                {
-                  "language": "<ISO 639-1 language code>",
-                  "response": "<your response in the detected language>"
-                }
-                
-                SUPPORTED LANGUAGES (Google Cloud TTS):
-                Use ONLY these language codes:
-                - "en" for English
-                - "hi" for Hindi (हिंदी)
-                - "ur" for Urdu (اردو) - phonetically same as Hindi
-                - "ar" for Arabic (العربية)
-                - "es" for Spanish (Español)
-                - "fr" for French (Français)
-                - "de" for German (Deutsch)
-                - "ja" for Japanese (日本語)
-                - "zh" for Chinese (中文)
-                - "pt" for Portuguese (Português)
-                - "bn" for Bengali (বাংলা)
-                - "te" for Telugu (తెలుగు)
-                - "ta" for Tamil (தமிழ்)
-                - "gu" for Gujarati (ગુજરાતી)
-                - "kn" for Kannada (ಕನ್ನಡ)
-                - "ml" for Malayalam (മലയാളം)
-                - "mr" for Marathi (मराठी)
-                
-                If user speaks a language NOT in this list, respond in English with "en".
-                
                 INSTRUCTIONS:
-                - Detect the language of the user's message
-                - Respond in the SAME language as the user
-                - Use ONLY the language codes listed above
+                - Respond in the SAME language as the user speaks
                 - Be professional, helpful, and comprehensive
                 - For complex questions, provide thorough explanations
                 - For simple questions, keep it concise
@@ -100,12 +71,7 @@ class LiveKitPipeline:
                 ❌ Citations, references, or source attributions
                 ❌ Phrases like "according to X" or "source: Y"
                 
-                ALWAYS:
-                ✅ Return valid JSON format (no markdown code blocks)
-                ✅ Detect user's language accurately
-                ✅ Use ONLY supported language codes
-                ✅ Respond in the same language
-                ✅ Provide natural, conversational responses"""
+                Provide natural, conversational responses in the user's language."""
             }
         ]
         
@@ -213,8 +179,6 @@ class LiveKitPipeline:
         
     async def generate_response_streaming(self, user_text: str):
         """Stream LLM response and yield chunks for TTS with language detection."""
-        import json
-        
         # Add user message to conversation history
         self.conversation_history.append({"role": "user", "content": user_text})
         
@@ -242,48 +206,41 @@ class LiveKitPipeline:
                 token = chunk.choices[0].delta.content
                 full_response += token
         
-        # Parse JSON response - extract JSON from anywhere in the response
-        try:
-            # First, try to find JSON block within markdown code blocks
-            json_text = full_response.strip()
-            
-            # Look for ```json block
-            if '```json' in json_text:
-                start = json_text.find('```json') + 7
-                end = json_text.find('```', start)
-                if end != -1:
-                    json_text = json_text[start:end].strip()
-            # Look for ``` block without json
-            elif '```' in json_text:
-                start = json_text.find('```') + 3
-                end = json_text.find('```', start)
-                if end != -1:
-                    json_text = json_text[start:end].strip()
-            
-            # Try to find JSON object by looking for { }
-            if not json_text.startswith('{'):
-                # Find first { and last }
-                start = json_text.find('{')
-                end = json_text.rfind('}')
-                if start != -1 and end != -1 and end > start:
-                    json_text = json_text[start:end+1].strip()
-            
-            response_data = json.loads(json_text)
-            language_code = response_data.get("language", "en")
-            response_text = response_data.get("response", full_response)
-        except (json.JSONDecodeError, ValueError) as e:
-            # Fallback if not valid JSON
-            logger.warning(f"LLM response not valid JSON: {e}. Response: {full_response[:200]}")
-            language_code = "en"
-            response_text = full_response
+        # Detect language using langdetect
+        from langdetect import detect, LangDetectException
         
-        # Save to conversation history (text only, not JSON)
-        self.conversation_history.append({"role": "assistant", "content": response_text})
+        try:
+            detected_lang = detect(full_response)
+            
+            # langdetect sometimes returns 'zh' instead of 'zh-cn' or 'zh-tw'
+            # Default Chinese to simplified (zh-cn)
+            if detected_lang == 'zh':
+                detected_lang = 'zh-cn'
+            
+            # Check if detected language is supported in VOICE_MAP
+            # (defined in synthesize_speech method)
+            supported_languages = {
+                "en", "hi", "ur", "bn", "mr", "ta", "te", "gu", "kn", "ml", "pa",
+                "es", "fr", "de", "pt", "it", "ja", "ko", "zh-cn", "zh-tw", "ar", "ru"
+            }
+            
+            if detected_lang in supported_languages:
+                language_code = detected_lang
+            else:
+                # Unsupported language, default to English
+                logger.info(f"🔍 Detected unsupported language '{detected_lang}', using English")
+                language_code = "en"
+            
+            logger.info(f"🔍 Detected language: {language_code}")
+        except LangDetectException:
+            logger.warning("Could not detect language, defaulting to English")
+            language_code = "en"
+        
+        # Save to conversation history
+        self.conversation_history.append({"role": "assistant", "content": full_response})
         
         # Yield response text with language code
-        yield {"text": response_text, "language": language_code}
-        # Save assistant's response to history
-        self.conversation_history.append({"role": "assistant", "content": full_response})
+        yield {"text": full_response, "language": language_code}
     
     async def synthesize_speech(self, text: str, language: str = "en") -> bytes:
         """
@@ -298,29 +255,32 @@ class LiveKitPipeline:
         """
         try:
             # Map language codes to Google Cloud TTS language codes and voices
-            # VERIFIED VOICES ONLY - these are confirmed to exist in Google Cloud TTS
-            lang_map = {
-                'en': ('en-US', 'en-US-Neural2-F'),
-                'hi': ('hi-IN', 'hi-IN-Neural2-A'),  # Hindi
-                'ur': ('ur-IN', 'ur-IN-Wavenet-A'),  # Urdu (phonetically same as Hindi, different script)
-                'ar': ('ar-XA', 'ar-XA-Standard-A'),  # Arabic
-                'es': ('es-ES', 'es-ES-Neural2-A'),  # Spanish
-                'fr': ('fr-FR', 'fr-FR-Neural2-A'),  # French
-                'de': ('de-DE', 'de-DE-Neural2-A'),  # German
-                'ja': ('ja-JP', 'ja-JP-Neural2-B'),  # Japanese
-                "pa": ("pa-IN", "pa-IN-Standard-A"), # Punjabi
-                'zh': ('cmn-CN', 'cmn-CN-Standard-A'),  # Chinese (Mandarin)
-                'pt': ('pt-BR', 'pt-BR-Neural2-A'),  # Portuguese
-                'bn': ('bn-IN', 'bn-IN-Standard-A'),  # Bengali
-                'te': ('te-IN', 'te-IN-Standard-A'),  # Telugu
-                'ta': ('ta-IN', 'ta-IN-Standard-A'),  # Tamil
-                'gu': ('gu-IN', 'gu-IN-Standard-A'),  # Gujarati
-                'kn': ('kn-IN', 'kn-IN-Standard-A'),  # Kannada
-                'ml': ('ml-IN', 'ml-IN-Standard-A'),  # Malayalam
-                'mr': ('mr-IN', 'mr-IN-Standard-A'),  # Marathi
+            VOICE_MAP = {
+                "en": ("en-IN-Standard-C", "en-IN"),
+                "hi": ("hi-IN-Standard-A", "hi-IN"),
+                "ur": ("ur-IN-Standard-A", "ur-IN"),
+                "bn": ("bn-IN-Standard-A", "bn-IN"),
+                "mr": ("mr-IN-Standard-A", "mr-IN"),
+                "ta": ("ta-IN-Standard-A", "ta-IN"),
+                "te": ("te-IN-Standard-A", "te-IN"),
+                "gu": ("gu-IN-Standard-A", "gu-IN"),
+                "kn": ("kn-IN-Standard-A", "kn-IN"),
+                "ml": ("ml-IN-Standard-A", "ml-IN"),
+                "pa": ("pa-IN-Standard-A", "pa-IN"),
+                "es": ("es-ES-Standard-A", "es-ES"),
+                "fr": ("fr-FR-Standard-A", "fr-FR"),
+                "de": ("de-DE-Standard-A", "de-DE"),
+                "pt": ("pt-BR-Standard-A", "pt-BR"),
+                "it": ("it-IT-Standard-A", "it-IT"),
+                "ja": ("ja-JP-Standard-B", "ja-JP"),
+                "ko": ("ko-KR-Standard-A", "ko-KR"),
+                "zh-cn": ("cmn-CN-Standard-A", "cmn-CN"),
+                "zh-tw": ("cmn-TW-Standard-A", "cmn-TW"),
+                "ar": ("ar-XA-Standard-A", "ar-XA"),
+                "ru": ("ru-RU-Standard-A", "ru-RU"),
             }
             
-            language_code, voice_name = lang_map.get(language, ('en-US', 'en-US-Neural2-F'))
+            voice_name, language_code = VOICE_MAP.get(language, ("en-IN-Standard-C", "en-IN"))
             
             # Use specified voice
             voice = texttospeech.VoiceSelectionParams(
