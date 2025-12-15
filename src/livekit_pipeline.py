@@ -42,12 +42,6 @@ class LiveKitPipeline:
             os.getenv("GOOGLE_CREDENTIALS_FILE")
         )
         
-        # Voice configuration
-        self.tts_voice = texttospeech.VoiceSelectionParams(
-            language_code="en-US",
-            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
-        )
-        
         # Conversation history for context
         self.conversation_history = []
         
@@ -157,7 +151,7 @@ class LiveKitPipeline:
             response = await self.openrouter_client.chat.completions.create(
                 model="google/gemini-2.0-flash-001:online",
                 messages=self.messages,
-                max_tokens=16000,
+                max_tokens=500,
                 temperature=0.7
             )
             
@@ -211,7 +205,7 @@ class LiveKitPipeline:
         stream = await self.openrouter_client.chat.completions.create(
             model="google/gemini-2.0-flash-001:online",
             messages=messages,
-            max_tokens=16000,
+            max_tokens=500,
             temperature=0.7,
             stream=True
         )
@@ -239,7 +233,7 @@ class LiveKitPipeline:
     
     async def synthesize_speech(self, text: str) -> bytes:
         """
-        Convert text to speech using Google Cloud TTS.
+        Convert text to speech using Google Cloud TTS with automatic language detection.
         
         Args:
             text: Text to synthesize
@@ -248,17 +242,54 @@ class LiveKitPipeline:
             PCM audio bytes (16-bit, mono, 16kHz)
         """
         try:
+            # Detect language from text for appropriate voice selection
+            from langdetect import detect, LangDetectException
+            
+            try:
+                detected_lang = detect(text)
+            except LangDetectException:
+                detected_lang = 'en'  # Default to English
+            
+            # Map language codes to Google Cloud TTS language codes and voices
+            lang_map = {
+                'en': ('en-US', 'en-US-Neural2-F'),
+                'hi': ('hi-IN', 'hi-IN-Neural2-A'),  # Hindi
+                'ur': ('ur-PK', 'ur-PK-Standard-A'),  # Urdu
+                'ar': ('ar-XA', 'ar-XA-Standard-A'),  # Arabic
+                'es': ('es-ES', 'es-ES-Neural2-A'),  # Spanish
+                'fr': ('fr-FR', 'fr-FR-Neural2-A'),  # French
+                'de': ('de-DE', 'de-DE-Neural2-A'),  # German
+                'ja': ('ja-JP', 'ja-JP-Neural2-B'),  # Japanese
+                'zh-cn': ('zh-CN', 'zh-CN-Neural2-C'),  # Chinese
+                'pt': ('pt-BR', 'pt-BR-Neural2-A'),  # Portuguese
+                'bn': ('bn-IN', 'bn-IN-Standard-A'),  # Bengali
+                'te': ('te-IN', 'te-IN-Standard-A'),  # Telugu
+                'ta': ('ta-IN', 'ta-IN-Standard-A'),  # Tamil
+                'gu': ('gu-IN', 'gu-IN-Standard-A'),  # Gujarati
+                'kn': ('kn-IN', 'kn-IN-Standard-A'),  # Kannada
+                'ml': ('ml-IN', 'ml-IN-Standard-A'),  # Malayalam
+                'mr': ('mr-IN', 'mr-IN-Standard-A'),  # Marathi
+            }
+            
+            language_code, voice_name = lang_map.get(detected_lang, ('en-US', 'en-US-Neural2-F'))
+            
+            # Use detected voice
+            voice = texttospeech.VoiceSelectionParams(
+                language_code=language_code,
+                name=voice_name
+            )
+            
             synthesis_input = texttospeech.SynthesisInput(text=text)
             
             # Call TTS API (synchronous, but fast enough)
             response = self.tts_client.synthesize_speech(
                 input=synthesis_input,
-                voice=self.tts_voice,
+                voice=voice,
                 audio_config=self.tts_audio_config
             )
             
             # response.audio_content is already PCM 16-bit mono at 16kHz
-            logger.info(f"🔊 TTS: Generated {len(response.audio_content)} bytes")
+            logger.info(f"🔊 TTS: Generated {len(response.audio_content)} bytes (lang: {detected_lang})")
             
             return response.audio_content
             

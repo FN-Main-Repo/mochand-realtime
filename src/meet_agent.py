@@ -109,10 +109,7 @@ class MeetVoiceAgent:
         # Feed audio frame to VAD for speech detection (non-blocking)
         self.vad_stream.push_frame(frame)
         
-        # IMPORTANT: Store ORIGINAL raw PCM for transcription (not VAD-processed audio)
-        # VAD resamples internally, we want the original quality for STT
-        if self.state == AgentState.COLLECTING:
-            self.audio_buffer.extend(pcm_data)
+        # VAD will provide frames via events - we collect from event.frames
     
     async def _vad_processor_task(self):
         """
@@ -139,17 +136,19 @@ class MeetVoiceAgent:
         from livekit.agents import vad
         
         if event.type == vad.VADEventType.START_OF_SPEECH:
-            await self._on_speech_start()
+            # START_OF_SPEECH includes prefix-padded frames - these contain the first words!
+            await self._on_speech_start(event)
             
         elif event.type == vad.VADEventType.INFERENCE_DONE:
-            # VAD inference completed - we don't need to collect frames here
-            # Original audio is being collected in audio_from_meet_callback()
-            pass
+            # Continue collecting speech frames during COLLECTING state
+            if self.state == AgentState.COLLECTING and event.frames:
+                for frame in event.frames:
+                    self.audio_buffer.extend(frame.data)
             
         elif event.type == vad.VADEventType.END_OF_SPEECH:
             await self._on_speech_end()
     
-    async def _on_speech_start(self):
+    async def _on_speech_start(self, event):
         """Handle start of speech event."""
         self.metrics["speech_events"] += 1
         
@@ -168,6 +167,12 @@ class MeetVoiceAgent:
             # Transition to collecting immediately
             self.state = AgentState.COLLECTING
             self.audio_buffer = bytearray()
+            
+            # Collect prefix-padded frames from VAD (contains first words!)
+            if event.frames:
+                for frame in event.frames:
+                    self.audio_buffer.extend(frame.data)
+            
             logger.info("🎤 Speech started - collecting audio (interrupted bot)")
             return
         
@@ -176,6 +181,12 @@ class MeetVoiceAgent:
             logger.info("🎤 Speech started - collecting audio")
             self.state = AgentState.COLLECTING
             self.audio_buffer = bytearray()
+            
+            # CRITICAL: Collect prefix-padded frames from VAD
+            # These frames contain audio BEFORE speech detection (first words!)
+            if event.frames:
+                for frame in event.frames:
+                    self.audio_buffer.extend(frame.data)
     
     async def _on_speech_end(self):
         """Handle end of speech event - process complete utterance."""
@@ -348,7 +359,7 @@ class MeetVoiceAgent:
             self.vad_model = silero.VAD.load(
                 min_speech_duration=0.1,       # 100ms to catch first words faster
                 min_silence_duration=0.8,      # 800ms to handle natural pauses
-                prefix_padding_duration=0.3,   # 300ms padding before
+                prefix_padding_duration=0.5,   # 500ms padding to capture first words
                 max_buffered_speech=30.0,      # Max 30s utterance
                 activation_threshold=0.4,      # Sensitive detection
                 sample_rate=self.sample_rate,  # Match Attendee (16kHz)
@@ -360,7 +371,7 @@ class MeetVoiceAgent:
             logger.info("✓ Silero VAD initialized")
             logger.info("  - Min speech: 100ms (fast detection)")
             logger.info("  - Min silence: 800ms (natural pauses)")
-            logger.info("  - Prefix padding: 300ms (captures first words)")
+            logger.info("  - Prefix padding: 500ms (captures first words)")
             logger.info("  - Max utterance: 30s")
             logger.info("  - Sample rate: 16kHz")
             logger.info("")
