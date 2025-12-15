@@ -54,35 +54,58 @@ class LiveKitPipeline:
         self.messages = [
             {
                 "role": "system",
-                "content": """You are Jarvis, an intelligent AI assistant in a professional Google Meet call. 
-                You help with brainstorming, answering questions, providing information, and facilitating discussions.
+                "content": """You are Jarvis, an intelligent AI assistant in a professional Google Meet call.
                 
-                CONVERSATION STYLE:
-                - Be professional, articulate, and helpful
-                - Provide comprehensive answers when needed (don't artificially limit length)
-                - For complex questions, give thorough explanations
+                RESPONSE FORMAT (CRITICAL):
+                You MUST respond in valid JSON format:
+                {
+                  "language": "<ISO 639-1 language code>",
+                  "response": "<your response in the detected language>"
+                }
+                
+                SUPPORTED LANGUAGES (Google Cloud TTS):
+                Use ONLY these language codes:
+                - "en" for English
+                - "hi" for Hindi (हिंदी)
+                - "ur" for Urdu (اردو) - phonetically same as Hindi
+                - "ar" for Arabic (العربية)
+                - "es" for Spanish (Español)
+                - "fr" for French (Français)
+                - "de" for German (Deutsch)
+                - "ja" for Japanese (日本語)
+                - "zh" for Chinese (中文)
+                - "pt" for Portuguese (Português)
+                - "bn" for Bengali (বাংলা)
+                - "te" for Telugu (తెలుగు)
+                - "ta" for Tamil (தமிழ்)
+                - "gu" for Gujarati (ગુજરાતી)
+                - "kn" for Kannada (ಕನ್ನಡ)
+                - "ml" for Malayalam (മലയാളം)
+                - "mr" for Marathi (मराठी)
+                
+                If user speaks a language NOT in this list, respond in English with "en".
+                
+                INSTRUCTIONS:
+                - Detect the language of the user's message
+                - Respond in the SAME language as the user
+                - Use ONLY the language codes listed above
+                - Be professional, helpful, and comprehensive
+                - For complex questions, provide thorough explanations
                 - For simple questions, keep it concise
-                - Use natural conversational language
-                - Remember context from earlier in the conversation
+                - Maintain conversation context
                 
-                CRITICAL RULES - THESE ARE MANDATORY:
-                ❌ NEVER include URLs, links, web addresses, or website names
-                ❌ NEVER use markdown formatting like [text](url) or (website.com)
-                ❌ NEVER mention source websites like accuweather.com, cambridge.org, aajtak.in, beidou.gov.cn, etc.
-                ❌ NEVER add citations, references, or source attributions
-                ❌ DO NOT write things like "according to X" or "source: Y" or "from Z website"
+                NEVER include:
+                ❌ URLs, links, web addresses, website names
+                ❌ Markdown formatting like [text](url)
+                ❌ Citations, references, or source attributions
+                ❌ Phrases like "according to X" or "source: Y"
                 
-                ✅ Provide information naturally as if you already know it
-                ✅ Match your response length to the complexity of the question
-                ✅ Maintain context and reference earlier parts of the conversation when relevant
-                
-                BAD EXAMPLE: "The temperature is 25 degrees aajtak.in"
-                GOOD EXAMPLE: "The temperature is 25 degrees Celsius"
-                
-                BAD EXAMPLE: "BeiDou is a navigation system beidou.gov.cn"
-                GOOD EXAMPLE: "BeiDou is China's satellite navigation system, similar to GPS"
-                
-                You are in a real professional meeting. Be helpful, intelligent, and contextually aware."""
+                ALWAYS:
+                ✅ Return valid JSON format (no markdown code blocks)
+                ✅ Detect user's language accurately
+                ✅ Use ONLY supported language codes
+                ✅ Respond in the same language
+                ✅ Provide natural, conversational responses"""
             }
         ]
         
@@ -189,7 +212,9 @@ class LiveKitPipeline:
             return "I'm sorry, I encountered an error processing your request."
         
     async def generate_response_streaming(self, user_text: str):
-        """Stream LLM response and yield chunks for TTS."""
+        """Stream LLM response and yield chunks for TTS with language detection."""
+        import json
+        
         # Add user message to conversation history
         self.conversation_history.append({"role": "user", "content": user_text})
         
@@ -205,62 +230,86 @@ class LiveKitPipeline:
         stream = await self.openrouter_client.chat.completions.create(
             model="google/gemini-2.0-flash-001:online",
             messages=messages,
-            max_tokens=500,
+            max_tokens=16000,
             temperature=0.7,
             stream=True
         )
         
         full_response = ""
-        sentence_buffer = ""
         
         async for chunk in stream:
             if chunk.choices[0].delta.content:
                 token = chunk.choices[0].delta.content
-                sentence_buffer += token
                 full_response += token
-                
-                # Yield complete sentences for TTS
-                if token in ['.', '!', '?', '\n']:
-                    yield sentence_buffer.strip()
-                    sentence_buffer = ""
         
-        # Yield any remaining text
-        if sentence_buffer.strip():
-            yield sentence_buffer.strip()
+        # Parse JSON response - extract JSON from anywhere in the response
+        try:
+            # First, try to find JSON block within markdown code blocks
+            json_text = full_response.strip()
+            
+            # Look for ```json block
+            if '```json' in json_text:
+                start = json_text.find('```json') + 7
+                end = json_text.find('```', start)
+                if end != -1:
+                    json_text = json_text[start:end].strip()
+            # Look for ``` block without json
+            elif '```' in json_text:
+                start = json_text.find('```') + 3
+                end = json_text.find('```', start)
+                if end != -1:
+                    json_text = json_text[start:end].strip()
+            
+            # Try to find JSON object by looking for { }
+            if not json_text.startswith('{'):
+                # Find first { and last }
+                start = json_text.find('{')
+                end = json_text.rfind('}')
+                if start != -1 and end != -1 and end > start:
+                    json_text = json_text[start:end+1].strip()
+            
+            response_data = json.loads(json_text)
+            language_code = response_data.get("language", "en")
+            response_text = response_data.get("response", full_response)
+        except (json.JSONDecodeError, ValueError) as e:
+            # Fallback if not valid JSON
+            logger.warning(f"LLM response not valid JSON: {e}. Response: {full_response[:200]}")
+            language_code = "en"
+            response_text = full_response
         
+        # Save to conversation history (text only, not JSON)
+        self.conversation_history.append({"role": "assistant", "content": response_text})
+        
+        # Yield response text with language code
+        yield {"text": response_text, "language": language_code}
         # Save assistant's response to history
         self.conversation_history.append({"role": "assistant", "content": full_response})
     
-    async def synthesize_speech(self, text: str) -> bytes:
+    async def synthesize_speech(self, text: str, language: str = "en") -> bytes:
         """
-        Convert text to speech using Google Cloud TTS with automatic language detection.
+        Convert text to speech using Google Cloud TTS with specified language.
         
         Args:
             text: Text to synthesize
+            language: ISO 639-1 language code (from LLM detection)
             
         Returns:
             PCM audio bytes (16-bit, mono, 16kHz)
         """
         try:
-            # Detect language from text for appropriate voice selection
-            from langdetect import detect, LangDetectException
-            
-            try:
-                detected_lang = detect(text)
-            except LangDetectException:
-                detected_lang = 'en'  # Default to English
-            
             # Map language codes to Google Cloud TTS language codes and voices
+            # VERIFIED VOICES ONLY - these are confirmed to exist in Google Cloud TTS
             lang_map = {
                 'en': ('en-US', 'en-US-Neural2-F'),
                 'hi': ('hi-IN', 'hi-IN-Neural2-A'),  # Hindi
-                'ur': ('ur-PK', 'ur-PK-Standard-A'),  # Urdu
+                'ur': ('ur-IN', 'ur-IN-Wavenet-A'),  # Urdu (phonetically same as Hindi, different script)
                 'ar': ('ar-XA', 'ar-XA-Standard-A'),  # Arabic
                 'es': ('es-ES', 'es-ES-Neural2-A'),  # Spanish
                 'fr': ('fr-FR', 'fr-FR-Neural2-A'),  # French
                 'de': ('de-DE', 'de-DE-Neural2-A'),  # German
                 'ja': ('ja-JP', 'ja-JP-Neural2-B'),  # Japanese
-                'zh-cn': ('zh-CN', 'zh-CN-Neural2-C'),  # Chinese
+                "pa": ("pa-IN", "pa-IN-Standard-A"), # Punjabi
+                'zh': ('cmn-CN', 'cmn-CN-Standard-A'),  # Chinese (Mandarin)
                 'pt': ('pt-BR', 'pt-BR-Neural2-A'),  # Portuguese
                 'bn': ('bn-IN', 'bn-IN-Standard-A'),  # Bengali
                 'te': ('te-IN', 'te-IN-Standard-A'),  # Telugu
@@ -271,9 +320,9 @@ class LiveKitPipeline:
                 'mr': ('mr-IN', 'mr-IN-Standard-A'),  # Marathi
             }
             
-            language_code, voice_name = lang_map.get(detected_lang, ('en-US', 'en-US-Neural2-F'))
+            language_code, voice_name = lang_map.get(language, ('en-US', 'en-US-Neural2-F'))
             
-            # Use detected voice
+            # Use specified voice
             voice = texttospeech.VoiceSelectionParams(
                 language_code=language_code,
                 name=voice_name
@@ -281,15 +330,14 @@ class LiveKitPipeline:
             
             synthesis_input = texttospeech.SynthesisInput(text=text)
             
-            # Call TTS API (synchronous, but fast enough)
+            # Call TTS API
             response = self.tts_client.synthesize_speech(
                 input=synthesis_input,
                 voice=voice,
                 audio_config=self.tts_audio_config
             )
             
-            # response.audio_content is already PCM 16-bit mono at 16kHz
-            logger.info(f"🔊 TTS: Generated {len(response.audio_content)} bytes (lang: {detected_lang})")
+            logger.info(f"🔊 TTS: Generated {len(response.audio_content)} bytes (lang: {language})")
             
             return response.audio_content
             
@@ -341,19 +389,20 @@ class LiveKitPipeline:
             return
         
         # Step 2 & 3: Stream LLM → TTS
-        # Each text chunk is immediately converted to audio and yielded
-        async for text_chunk in self.generate_response_streaming(text):
-            # Clean the text chunk before TTS
-            import re
-            clean_chunk = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text_chunk)
-            clean_chunk = re.sub(r'https?://\S+', '', clean_chunk)
-            clean_chunk = re.sub(r'\b[a-zA-Z0-9-]+\.(com|org|net|io|dev|ai)\b', '', clean_chunk)
-            clean_chunk = re.sub(r'\s+', ' ', clean_chunk).strip()
+        # Get response with language detection from LLM
+        async for response_data in self.generate_response_streaming(text):
+            response_text = response_data["text"]
+            language_code = response_data["language"]
             
-            if clean_chunk:
-                # Convert this chunk to audio immediately
-                audio_chunk = await self.synthesize_speech(clean_chunk)
-                
-                # Yield audio chunk right away
-                logger.info(f"🔊 TTS chunk: {len(audio_chunk)} bytes for '{clean_chunk}'")
+            # Clean the text before TTS
+            import re
+            clean_text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', response_text)
+            clean_text = re.sub(r'https?://\S+', '', clean_text)
+            clean_text = re.sub(r'\b[a-zA-Z0-9-]+\.(com|org|net|io|dev|ai)\b', '', clean_text)
+            clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+            
+            if clean_text:
+                logger.info(f"🔊 TTS chunk: {len(clean_text)} chars for '{clean_text[:100]}'")
+                # Convert to speech with detected language
+                audio_chunk = await self.synthesize_speech(clean_text, language_code)
                 yield audio_chunk

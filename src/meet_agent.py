@@ -65,9 +65,10 @@ class MeetVoiceAgent:
         self.state = AgentState.IDLE
         self.audio_buffer = bytearray()
         
-        # Output queue for non-blocking audio sending
-        self.output_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
-        self.sender_task: Optional[asyncio.Task] = None
+        # Output management (NO QUEUE - direct sending)
+        self.current_audio_task: Optional[asyncio.Task] = None  # Track task for cancellation
+        self.processing_task: Optional[asyncio.Task] = None  # Track utterance processing task
+        self.sender_task: Optional[asyncio.Task] = None  # Keep for backwards compat
         self.vad_processor_task: Optional[asyncio.Task] = None
         self.is_running = False  # Flag to prevent operations after cleanup
         self.sender_active = False  # Track if audio sender is actively sending
@@ -152,17 +153,23 @@ class MeetVoiceAgent:
         """Handle start of speech event."""
         self.metrics["speech_events"] += 1
         
-        if self.sender_active:
-            # User interrupted the bot while it was actively sending audio
-            logger.info("🛑 User interrupted bot response")
+        # Check if we need to interrupt ongoing processing/speaking
+        if self.sender_active or self.state in [AgentState.PROCESSING, AgentState.BOT_SPEAKING]:
+            # User interrupted the bot
+            logger.info("🛑 User interrupted bot - cancelling immediately")
             self.metrics["interruptions"] += 1
             
-            # Clear output queue
-            while not self.output_queue.empty():
-                try:
-                    self.output_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+            # IMMEDIATELY cancel current audio sending
+            if self.current_audio_task and not self.current_audio_task.done():
+                self.current_audio_task.cancel()
+                logger.info("⏹️ Cancelled audio task")
+            
+            # IMMEDIATELY cancel processing task (STT/LLM/TTS pipeline)
+            if self.processing_task and not self.processing_task.done():
+                self.processing_task.cancel()
+                logger.info("⏹️ Cancelled processing task")
+            
+            self.sender_active = False
             
             # Transition to collecting immediately
             self.state = AgentState.COLLECTING
@@ -204,13 +211,14 @@ class MeetVoiceAgent:
             self.state = AgentState.IDLE
             return
         
-        # Process complete utterance
+        # Process complete utterance in PARALLEL (don't await)
         self.state = AgentState.PROCESSING
-        await self._process_complete_utterance(utterance_audio)
+        self.processing_task = asyncio.create_task(self._process_complete_utterance(utterance_audio))
     
     async def _process_complete_utterance(self, audio_pcm: bytes):
         """
         Process complete utterance through streaming STT → LLM → TTS pipeline.
+        Runs as background task, can be cancelled on interruption.
         
         Args:
             audio_pcm: Complete utterance audio
@@ -221,7 +229,7 @@ class MeetVoiceAgent:
             
             logger.info("🔄 Processing complete utterance through streaming pipeline")
             
-            # Use streaming pipeline
+            # Use streaming pipeline - send audio IMMEDIATELY (no queue)
             self.state = AgentState.BOT_SPEAKING
             
             chunk_count = 0
@@ -231,64 +239,44 @@ class MeetVoiceAgent:
                     logger.info("⏹️ Stopping response due to interruption")
                     return  # Exit immediately, new speech is being collected
                 
-                # Queue audio chunk for sending (non-blocking)
+                # Send audio chunk IMMEDIATELY (no queue buffering)
+                self.current_audio_task = asyncio.create_task(
+                    self._send_audio_chunk(audio_chunk)
+                )
+                
                 try:
-                    await asyncio.wait_for(
-                        self.output_queue.put(audio_chunk),
-                        timeout=1.0
-                    )
+                    await self.current_audio_task
                     chunk_count += 1
-                except asyncio.TimeoutError:
-                    logger.warning("Output queue full, dropping chunk")
+                except asyncio.CancelledError:
+                    logger.info("⏹️ Audio sending cancelled (user interrupted)")
+                    return  # Stop processing this response
             
-            logger.info(f"✅ Queued {chunk_count} audio chunks for streaming")
+            logger.info(f"✅ Sent {chunk_count} audio chunks")
             
             # Return to idle after speaking (if not interrupted)
             if self.state == AgentState.BOT_SPEAKING:
                 self.state = AgentState.IDLE
+        
+        except asyncio.CancelledError:
+            logger.info("⏹️ Processing cancelled by user interruption")
+            self.state = AgentState.IDLE
+            raise  # Re-raise to properly cancel the task
                 
         except Exception as e:
             logger.error(f"Error processing utterance: {e}", exc_info=True)
             self.state = AgentState.IDLE
     
-    async def _audio_sender_task(self):
-        """
-        Background task that continuously sends audio chunks to Meet.
-        This prevents blocking the main VAD processing loop.
-        """
-        logger.info("🔊 Audio sender task started")
+    async def _send_audio_chunk(self, audio_chunk: bytes):
+        """Send a single audio chunk to the meeting."""
+        self.sender_active = True
         
-        try:
-            while True:
-                # Get next audio chunk from queue
-                audio_chunk = await self.output_queue.get()
-                
-                if audio_chunk is None:  # Poison pill to stop
-                    logger.info("Audio sender task stopping")
-                    break
-                
-                # Mark sender as active (bot is speaking)
-                self.sender_active = True
-                
-                # Send audio to Meet (this call chunks and delays internally)
-                if self.bridge:
-                    try:
-                        await self.bridge.send_audio(audio_chunk, self.sample_rate)
-                    except Exception as e:
-                        logger.error(f"Error sending audio chunk: {e}")
-                
-                self.output_queue.task_done()
-                
-                # Mark inactive if queue is empty (bot finished speaking)
-                if self.output_queue.empty():
-                    self.sender_active = False
-                
-        except asyncio.CancelledError:
-            logger.info("Audio sender task cancelled")
-        except Exception as e:
-            logger.error(f"Audio sender task error: {e}", exc_info=True)
-        finally:
-            self.sender_active = False
+        if self.bridge:
+            try:
+                await self.bridge.send_audio(audio_chunk, self.sample_rate)
+            except Exception as e:
+                logger.error(f"Error sending audio chunk: {e}")
+        
+        self.sender_active = False
     
     def has_speech(self, audio_array: np.ndarray) -> bool:
         """
@@ -379,9 +367,8 @@ class MeetVoiceAgent:
             # Mark as running before starting tasks
             self.is_running = True
             
-            # Start background audio sender task
-            self.sender_task = asyncio.create_task(self._audio_sender_task())
-            logger.info("✓ Background audio sender started")
+            # NO LONGER NEED audio sender task - we send directly now
+            # Audio is sent immediately in _process_complete_utterance
             
             # Start background VAD processor task
             self.vad_processor_task = asyncio.create_task(self._vad_processor_task())
@@ -488,15 +475,26 @@ class MeetVoiceAgent:
                 await self.vad_stream.aclose()
             except Exception as e:
                 logger.error(f"Error closing VAD stream: {e}")
-                # Stop audio sender task
-        if self.sender_task:
+        
+        # Cancel current audio task if running
+        if self.current_audio_task and not self.current_audio_task.done():
             try:
-                await self.output_queue.put(None)  # Poison pill
-                await asyncio.wait_for(self.sender_task, timeout=2.0)
-            except asyncio.TimeoutError:
-                self.sender_task.cancel()
+                self.current_audio_task.cancel()
+                await asyncio.wait_for(self.current_audio_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
             except Exception as e:
-                logger.error(f"Error stopping sender task: {e}")
+                logger.error(f"Error cancelling audio task: {e}")
+        
+        # Cancel processing task if running
+        if self.processing_task and not self.processing_task.done():
+            try:
+                self.processing_task.cancel()
+                await asyncio.wait_for(self.processing_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception as e:
+                logger.error(f"Error cancelling processing task: {e}")
         
         # Print metrics
         logger.info("\n📊 Session Metrics:")
