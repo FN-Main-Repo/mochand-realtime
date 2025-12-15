@@ -140,6 +140,7 @@ class MeetSession:
     async def leave_meeting(self) -> bool:
         """
         Make the bot leave the meeting.
+        Handles various bot states properly.
         
         Returns:
             True if successful
@@ -155,17 +156,31 @@ class MeetSession:
         }
         
         async with aiohttp.ClientSession() as session:
+            # First try to end the recording/call
+            try:
+                async with session.post(
+                    f"{self.api_url}/bots/{self.bot_id}/leave",
+                    headers=headers
+                ) as response:
+                    if response.status in [200, 204]:
+                        logger.info("✓ Bot left meeting successfully")
+                        return True
+            except Exception as e:
+                logger.debug(f"Leave endpoint failed: {e}, trying delete...")
+            
+            # If leave doesn't work, try delete
             async with session.delete(
                 f"{self.api_url}/bots/{self.bot_id}",
                 headers=headers
             ) as response:
-                if response.status not in [200, 204]:
+                if response.status in [200, 204]:
+                    logger.info("✓ Bot removed successfully")
+                    return True
+                else:
                     error_text = await response.text()
-                    logger.error(f"Failed to leave meeting: {response.status} - {error_text}")
+                    logger.warning(f"Could not remove bot: {response.status} - {error_text}")
+                    logger.info("🛡️ Bot will be automatically removed by Attendee.dev after timeout")
                     return False
-                
-                logger.info("✓ Bot left meeting successfully")
-                return True
 
     async def monitor_bot_state(self, interval: int = 5) -> None:
         """

@@ -8,8 +8,11 @@ import logging
 import os
 import sys
 from typing import Optional
+from enum import Enum
 from dotenv import load_dotenv
 import numpy as np
+from livekit.plugins import silero
+from livekit import rtc
 
 from attendee_bridge import AttendeeBridge
 from meet_session import MeetSession
@@ -26,6 +29,15 @@ logging.basicConfig(
 logger = logging.getLogger("meet-agent")
 
 
+class AgentState(Enum):
+    """Conversation state machine states."""
+    IDLE = "idle"                    # No speech, waiting
+    COLLECTING = "collecting"        # Speech detected, buffering
+    PROCESSING = "processing"        # Utterance complete, running STT→LLM
+    BOT_SPEAKING = "bot_speaking"    # Sending response to Meet
+    INTERRUPTED = "interrupted"      # User spoke during bot response
+
+
 class MeetVoiceAgent:
     """
     Google Meet Voice Agent integrating Attendee.dev with LiveKit.
@@ -39,82 +51,233 @@ class MeetVoiceAgent:
         self.bridge: Optional[AttendeeBridge] = None
         self.meet_session: Optional[MeetSession] = None
         
-        # Audio buffers
-        self.audio_buffer = bytearray()
+        # Audio configuration
         self.sample_rate = 16000
         
         # LiveKit STT → LLM → TTS pipeline
         self.pipeline = LiveKitPipeline()
         
-        # Processing state
-        self.is_processing = False
-        self.min_speech_duration_ms = 1500  # Minimum 1.5 seconds of audio before processing
+        # Silero VAD (initialized in start())
+        self.vad_model: Optional[silero.VAD] = None
+        self.vad_stream: Optional[silero.VADStream] = None
         
-        logger.info("MeetVoiceAgent initialized with LiveKit STT/LLM/TTS")
+        # State machine
+        self.state = AgentState.IDLE
+        self.audio_buffer = bytearray()
+        
+        # Output queue for non-blocking audio sending
+        self.output_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
+        self.sender_task: Optional[asyncio.Task] = None
+        self.vad_processor_task: Optional[asyncio.Task] = None
+        self.is_running = False  # Flag to prevent operations after cleanup
+        self.sender_active = False  # Track if audio sender is actively sending
+        
+        # Metrics
+        self.metrics = {
+            "speech_events": 0,
+            "utterances_processed": 0,
+            "interruptions": 0,
+            "total_turns": 0
+        }
+        
+        logger.info("MeetVoiceAgent initialized - ready for VAD setup")
 
     async def audio_from_meet_callback(self, pcm_data: bytes, sample_rate: int):
         """
         Callback when audio is received from Google Meet via Attendee.dev.
+        Uses Silero VAD to detect complete utterances.
         
         Args:
             pcm_data: Raw PCM audio from meeting (16-bit, mono)
             sample_rate: Sample rate of the audio
         """
-        duration_ms = AudioTransport.get_audio_duration_ms(pcm_data, sample_rate)
-        
-        # Log occasionally to avoid spam
-        if len(self.audio_buffer) % 50000 < 1000:
-            logger.debug(
-                f"📥 Received audio from Meet: {len(pcm_data)} bytes, "
-                f"{duration_ms:.1f}ms @ {sample_rate}Hz"
-            )
-        
-        # Add to buffer
-        self.audio_buffer.extend(pcm_data)
-        
-        # Process when we have enough audio
-        buffer_duration_ms = len(self.audio_buffer) / (sample_rate * 2) * 1000
-        
-        if buffer_duration_ms >= self.min_speech_duration_ms and not self.is_processing:
-            await self.process_audio_chunk()
-
-    async def process_audio_chunk(self):
-        """
-        Process accumulated audio through LiveKit STT → LLM → TTS pipeline.
-        """
-        if not self.audio_buffer or self.is_processing:
+        if not self.vad_stream or not self.is_running:
             return
         
-        self.is_processing = True
+        # Convert raw PCM bytes to AudioFrame for VAD detection
+        # pcm_data is 16-bit signed int, mono
+        audio_array = np.frombuffer(pcm_data, dtype=np.int16)
+        
+        # Create AudioFrame with correct format for VAD
+        frame = rtc.AudioFrame(
+            data=audio_array.tobytes(),
+            sample_rate=sample_rate,
+            num_channels=1,
+            samples_per_channel=len(audio_array)
+        )
+        
+        # Feed audio frame to VAD for speech detection (non-blocking)
+        self.vad_stream.push_frame(frame)
+        
+        # IMPORTANT: Store ORIGINAL raw PCM for transcription (not VAD-processed audio)
+        # VAD resamples internally, we want the original quality for STT
+        if self.state == AgentState.COLLECTING:
+            self.audio_buffer.extend(pcm_data)
+    
+    async def _vad_processor_task(self):
+        """
+        Background task that processes VAD events from the async iterator.
+        """
+        logger.info("🎙️ VAD processor task started")
         
         try:
-            # Get all accumulated audio
-            chunk = bytes(self.audio_buffer)
-            self.audio_buffer = bytearray()
-            
-            logger.info(f"🔄 Processing {len(chunk)} bytes through LiveKit pipeline...")
-            
-            # Check if audio contains speech (simple energy check)
-            audio_array = np.frombuffer(chunk, dtype=np.int16)
-            
-            if not self.has_speech(audio_array):
-                logger.debug("No speech detected in audio chunk")
-                return
-            
-            logger.info("🎤 Speech detected! Processing through STT → LLM → TTS...")
-            
-            # Process through full pipeline
-            response_audio = await self.pipeline.process_audio(chunk, self.sample_rate)
-            
-            if response_audio and self.bridge:
-                await self.bridge.send_audio(response_audio, self.sample_rate)
-                logger.info(f"📤 Sent AI response to Meet: {len(response_audio)} bytes")
-            
+            async for event in self.vad_stream:
+                logger.debug(f"VAD event received: {event.type}")
+                await self._handle_vad_event(event)
+        except asyncio.CancelledError:
+            logger.info("VAD processor task cancelled")
         except Exception as e:
-            logger.error(f"Error processing audio: {e}", exc_info=True)
+            logger.error(f"VAD processor task error: {e}", exc_info=True)
+
+    async def _handle_vad_event(self, event):
+        """
+        Handle VAD events for speech detection.
         
+        Args:
+            event: VAD event from Silero
+        """
+        from livekit.agents import vad
+        
+        if event.type == vad.VADEventType.START_OF_SPEECH:
+            await self._on_speech_start()
+            
+        elif event.type == vad.VADEventType.INFERENCE_DONE:
+            # VAD inference completed - we don't need to collect frames here
+            # Original audio is being collected in audio_from_meet_callback()
+            pass
+            
+        elif event.type == vad.VADEventType.END_OF_SPEECH:
+            await self._on_speech_end()
+    
+    async def _on_speech_start(self):
+        """Handle start of speech event."""
+        self.metrics["speech_events"] += 1
+        
+        if self.sender_active:
+            # User interrupted the bot while it was actively sending audio
+            logger.info("🛑 User interrupted bot response")
+            self.metrics["interruptions"] += 1
+            
+            # Clear output queue
+            while not self.output_queue.empty():
+                try:
+                    self.output_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            
+            # Transition to collecting immediately
+            self.state = AgentState.COLLECTING
+            self.audio_buffer = bytearray()
+            logger.info("🎤 Speech started - collecting audio (interrupted bot)")
+            return
+        
+        # Start collecting speech from idle
+        if self.state == AgentState.IDLE:
+            logger.info("🎤 Speech started - collecting audio")
+            self.state = AgentState.COLLECTING
+            self.audio_buffer = bytearray()
+    
+    async def _on_speech_end(self):
+        """Handle end of speech event - process complete utterance."""
+        if self.state != AgentState.COLLECTING:
+            return
+        
+        utterance_audio = bytes(self.audio_buffer)
+        self.audio_buffer = bytearray()
+        
+        duration_sec = len(utterance_audio) / (self.sample_rate * 2)
+        logger.info(f"🔇 Speech ended - collected {len(utterance_audio)} bytes ({duration_sec:.2f}s)")
+        
+        if len(utterance_audio) < 3200:  # Less than 0.1s of audio
+            logger.debug("Utterance too short, ignoring")
+            self.state = AgentState.IDLE
+            return
+        
+        # Process complete utterance
+        self.state = AgentState.PROCESSING
+        await self._process_complete_utterance(utterance_audio)
+    
+    async def _process_complete_utterance(self, audio_pcm: bytes):
+        """
+        Process complete utterance through streaming STT → LLM → TTS pipeline.
+        
+        Args:
+            audio_pcm: Complete utterance audio
+        """
+        try:
+            self.metrics["utterances_processed"] += 1
+            self.metrics["total_turns"] += 1
+            
+            logger.info("🔄 Processing complete utterance through streaming pipeline")
+            
+            # Use streaming pipeline
+            self.state = AgentState.BOT_SPEAKING
+            
+            chunk_count = 0
+            async for audio_chunk in self.pipeline.process_audio_streaming(audio_pcm, self.sample_rate):
+                # Check for interruption (state changed by _on_speech_start)
+                if self.state == AgentState.COLLECTING:
+                    logger.info("⏹️ Stopping response due to interruption")
+                    return  # Exit immediately, new speech is being collected
+                
+                # Queue audio chunk for sending (non-blocking)
+                try:
+                    await asyncio.wait_for(
+                        self.output_queue.put(audio_chunk),
+                        timeout=1.0
+                    )
+                    chunk_count += 1
+                except asyncio.TimeoutError:
+                    logger.warning("Output queue full, dropping chunk")
+            
+            logger.info(f"✅ Queued {chunk_count} audio chunks for streaming")
+            
+            # Return to idle after speaking (if not interrupted)
+            if self.state == AgentState.BOT_SPEAKING:
+                self.state = AgentState.IDLE
+                
+        except Exception as e:
+            logger.error(f"Error processing utterance: {e}", exc_info=True)
+            self.state = AgentState.IDLE
+    
+    async def _audio_sender_task(self):
+        """
+        Background task that continuously sends audio chunks to Meet.
+        This prevents blocking the main VAD processing loop.
+        """
+        logger.info("🔊 Audio sender task started")
+        
+        try:
+            while True:
+                # Get next audio chunk from queue
+                audio_chunk = await self.output_queue.get()
+                
+                if audio_chunk is None:  # Poison pill to stop
+                    logger.info("Audio sender task stopping")
+                    break
+                
+                # Mark sender as active (bot is speaking)
+                self.sender_active = True
+                
+                # Send audio to Meet (this call chunks and delays internally)
+                if self.bridge:
+                    try:
+                        await self.bridge.send_audio(audio_chunk, self.sample_rate)
+                    except Exception as e:
+                        logger.error(f"Error sending audio chunk: {e}")
+                
+                self.output_queue.task_done()
+                
+                # Mark inactive if queue is empty (bot finished speaking)
+                if self.output_queue.empty():
+                    self.sender_active = False
+                
+        except asyncio.CancelledError:
+            logger.info("Audio sender task cancelled")
+        except Exception as e:
+            logger.error(f"Audio sender task error: {e}", exc_info=True)
         finally:
-            self.is_processing = False
+            self.sender_active = False
     
     def has_speech(self, audio_array: np.ndarray) -> bool:
         """
@@ -176,6 +339,43 @@ class MeetVoiceAgent:
             meeting_url: Google Meet URL to join
         """
         try:
+            # Step 0: Initialize Silero VAD
+            logger.info("=" * 60)
+            logger.info("STEP 0: Initializing Voice Activity Detection")
+            logger.info("=" * 60)
+            
+            logger.info("Loading Silero VAD model...")
+            self.vad_model = silero.VAD.load(
+                min_speech_duration=0.1,       # 100ms to catch first words faster
+                min_silence_duration=0.8,      # 800ms to handle natural pauses
+                prefix_padding_duration=0.3,   # 300ms padding before
+                max_buffered_speech=30.0,      # Max 30s utterance
+                activation_threshold=0.4,      # Sensitive detection
+                sample_rate=self.sample_rate,  # Match Attendee (16kHz)
+                force_cpu=True                 # Reliable performance
+            )
+            
+            self.vad_stream = self.vad_model.stream()
+            
+            logger.info("✓ Silero VAD initialized")
+            logger.info("  - Min speech: 100ms (fast detection)")
+            logger.info("  - Min silence: 800ms (natural pauses)")
+            logger.info("  - Prefix padding: 300ms (captures first words)")
+            logger.info("  - Max utterance: 30s")
+            logger.info("  - Sample rate: 16kHz")
+            logger.info("")
+            
+            # Mark as running before starting tasks
+            self.is_running = True
+            
+            # Start background audio sender task
+            self.sender_task = asyncio.create_task(self._audio_sender_task())
+            logger.info("✓ Background audio sender started")
+            
+            # Start background VAD processor task
+            self.vad_processor_task = asyncio.create_task(self._vad_processor_task())
+            logger.info("✓ Background VAD processor started\n")
+            
             # Step 1: Start WebSocket server
             logger.info("=" * 60)
             logger.info("STEP 1: Starting WebSocket Server")
@@ -256,6 +456,42 @@ class MeetVoiceAgent:
     async def cleanup(self):
         """Clean up resources."""
         logger.info("Cleaning up...")
+        
+        # Stop accepting new audio immediately
+        self.is_running = False
+        await asyncio.sleep(0.1)  # Brief pause for in-flight operations
+        
+        # Stop VAD processor task
+        if self.vad_processor_task:
+            try:
+                self.vad_processor_task.cancel()
+                await asyncio.wait_for(self.vad_processor_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            except Exception as e:
+                logger.error(f"Error stopping VAD processor: {e}")
+        
+        # Close VAD stream
+        if self.vad_stream:
+            try:
+                await self.vad_stream.aclose()
+            except Exception as e:
+                logger.error(f"Error closing VAD stream: {e}")
+                # Stop audio sender task
+        if self.sender_task:
+            try:
+                await self.output_queue.put(None)  # Poison pill
+                await asyncio.wait_for(self.sender_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                self.sender_task.cancel()
+            except Exception as e:
+                logger.error(f"Error stopping sender task: {e}")
+        
+        # Print metrics
+        logger.info("\n📊 Session Metrics:")
+        for key, value in self.metrics.items():
+            logger.info(f"  {key}: {value}")
+        logger.info("")
         
         if self.meet_session:
             try:

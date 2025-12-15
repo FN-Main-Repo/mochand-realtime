@@ -48,6 +48,9 @@ class LiveKitPipeline:
             ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
         )
         
+        # Conversation history for context
+        self.conversation_history = []
+        
         self.tts_audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.LINEAR16,
             sample_rate_hertz=16000
@@ -57,18 +60,35 @@ class LiveKitPipeline:
         self.messages = [
             {
                 "role": "system",
-                "content": """You are Jarvis, a helpful AI voice assistant in a Google Meet call. 
-                You provide concise, natural responses suitable for voice conversation.
-                Keep responses brief (1-2 sentences maximum).
-                Be friendly, professional, and helpful.
+                "content": """You are Jarvis, an intelligent AI assistant in a professional Google Meet call. 
+                You help with brainstorming, answering questions, providing information, and facilitating discussions.
                 
-                CRITICAL RULES:
-                - NEVER include URLs, links, web addresses, or website names
-                - NEVER use markdown formatting like [text](url) 
-                - NEVER mention source websites like accuweather.com, cambridge.org, etc.
-                - NEVER add citations or references
-                - Only provide the information itself, not where it came from
-                - Speak naturally as if in a conversation, not reading from sources"""
+                CONVERSATION STYLE:
+                - Be professional, articulate, and helpful
+                - Provide comprehensive answers when needed (don't artificially limit length)
+                - For complex questions, give thorough explanations
+                - For simple questions, keep it concise
+                - Use natural conversational language
+                - Remember context from earlier in the conversation
+                
+                CRITICAL RULES - THESE ARE MANDATORY:
+                ❌ NEVER include URLs, links, web addresses, or website names
+                ❌ NEVER use markdown formatting like [text](url) or (website.com)
+                ❌ NEVER mention source websites like accuweather.com, cambridge.org, aajtak.in, beidou.gov.cn, etc.
+                ❌ NEVER add citations, references, or source attributions
+                ❌ DO NOT write things like "according to X" or "source: Y" or "from Z website"
+                
+                ✅ Provide information naturally as if you already know it
+                ✅ Match your response length to the complexity of the question
+                ✅ Maintain context and reference earlier parts of the conversation when relevant
+                
+                BAD EXAMPLE: "The temperature is 25 degrees aajtak.in"
+                GOOD EXAMPLE: "The temperature is 25 degrees Celsius"
+                
+                BAD EXAMPLE: "BeiDou is a navigation system beidou.gov.cn"
+                GOOD EXAMPLE: "BeiDou is China's satellite navigation system, similar to GPS"
+                
+                You are in a real professional meeting. Be helpful, intelligent, and contextually aware."""
             }
         ]
         
@@ -137,12 +157,8 @@ class LiveKitPipeline:
             response = await self.openrouter_client.chat.completions.create(
                 model="google/gemini-2.0-flash-001:online",
                 messages=self.messages,
-                max_tokens=100,  # Shorter responses = faster
-                temperature=0.7,  # Slightly more focused responses
-                extra_headers={
-                    "HTTP-Referer": "https://mochand.com",
-                    "X-Title": "Google Meet Voice Agent"
-                }
+                max_tokens=16000,
+                temperature=0.7
             )
             
             assistant_text = response.choices[0].message.content.strip()
@@ -177,6 +193,49 @@ class LiveKitPipeline:
         except Exception as e:
             logger.error(f"LLM error: {e}", exc_info=True)
             return "I'm sorry, I encountered an error processing your request."
+        
+    async def generate_response_streaming(self, user_text: str):
+        """Stream LLM response and yield chunks for TTS."""
+        # Add user message to conversation history
+        self.conversation_history.append({"role": "user", "content": user_text})
+        
+        # Build messages: system prompt + conversation history
+        messages = self.messages.copy()  # Start with system prompt
+        messages.extend(self.conversation_history)  # Add all conversation
+        
+        # Trim old messages if too long (keep system + last 6 messages)
+        if len(messages) > 7:
+            messages = [messages[0]] + messages[-6:]
+        
+        # Enable streaming
+        stream = await self.openrouter_client.chat.completions.create(
+            model="google/gemini-2.0-flash-001:online",
+            messages=messages,
+            max_tokens=16000,
+            temperature=0.7,
+            stream=True
+        )
+        
+        full_response = ""
+        sentence_buffer = ""
+        
+        async for chunk in stream:
+            if chunk.choices[0].delta.content:
+                token = chunk.choices[0].delta.content
+                sentence_buffer += token
+                full_response += token
+                
+                # Yield complete sentences for TTS
+                if token in ['.', '!', '?', '\n']:
+                    yield sentence_buffer.strip()
+                    sentence_buffer = ""
+        
+        # Yield any remaining text
+        if sentence_buffer.strip():
+            yield sentence_buffer.strip()
+        
+        # Save assistant's response to history
+        self.conversation_history.append({"role": "assistant", "content": full_response})
     
     async def synthesize_speech(self, text: str) -> bytes:
         """
@@ -232,3 +291,38 @@ class LiveKitPipeline:
         response_audio = await self.synthesize_speech(response_text)
         
         return response_audio
+    
+    async def process_audio_streaming(self, audio_pcm: bytes, sample_rate: int = 16000):
+        """
+        STREAMING pipeline: Audio → STT → LLM (streaming) → TTS (per chunk) → Audio chunks
+        
+        Args:
+            audio_pcm: Input audio PCM bytes
+            sample_rate: Audio sample rate
+            
+        Yields:
+            Audio PCM chunks as they're generated
+        """
+        # Step 1: STT (still blocking, but fast with Whisper)
+        text = await self.transcribe_audio(audio_pcm, sample_rate)
+        
+        if not text:
+            return
+        
+        # Step 2 & 3: Stream LLM → TTS
+        # Each text chunk is immediately converted to audio and yielded
+        async for text_chunk in self.generate_response_streaming(text):
+            # Clean the text chunk before TTS
+            import re
+            clean_chunk = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text_chunk)
+            clean_chunk = re.sub(r'https?://\S+', '', clean_chunk)
+            clean_chunk = re.sub(r'\b[a-zA-Z0-9-]+\.(com|org|net|io|dev|ai)\b', '', clean_chunk)
+            clean_chunk = re.sub(r'\s+', ' ', clean_chunk).strip()
+            
+            if clean_chunk:
+                # Convert this chunk to audio immediately
+                audio_chunk = await self.synthesize_speech(clean_chunk)
+                
+                # Yield audio chunk right away
+                logger.info(f"🔊 TTS chunk: {len(audio_chunk)} bytes for '{clean_chunk}'")
+                yield audio_chunk

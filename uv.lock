@@ -15,15 +15,19 @@ name = "agent-starter-python"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "faiss-cpu", version = "1.13.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "faiss-cpu", version = "1.13.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "google-cloud-texttospeech" },
     { name = "livekit-agents", extra = ["google", "openai", "sarvam", "silero", "turn-detector"] },
     { name = "livekit-plugins-noise-cancellation" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "openai" },
     { name = "python-dotenv" },
     { name = "sentence-transformers" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -37,12 +41,16 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.9.0" },
     { name = "faiss-cpu", specifier = ">=1.13.0" },
+    { name = "google-cloud-texttospeech", specifier = ">=2.14.0" },
     { name = "livekit-agents", extras = ["google", "openai", "sarvam", "silero", "turn-detector"], specifier = "~=1.2" },
     { name = "livekit-plugins-noise-cancellation", specifier = "~=0.2" },
     { name = "numpy", specifier = ">=2.0.2" },
+    { name = "openai", specifier = ">=1.0.0" },
     { name = "python-dotenv" },
     { name = "sentence-transformers", specifier = ">=5.1.2" },
+    { name = "websockets", specifier = ">=12.0" },
 ]
 
 [package.metadata.requires-dev]

@@ -158,7 +158,7 @@ class AttendeeBridge:
 
     async def send_audio(self, pcm_data: bytes, sample_rate: int = 16000, chunk_duration_ms: int = 20):
         """
-        Send audio data to Attendee bot in small chunks.
+        Send audio data to Attendee bot in small chunks for smooth playback.
         
         Args:
             pcm_data: Raw PCM audio bytes (16-bit, mono)
@@ -189,13 +189,15 @@ class AttendeeBridge:
                 chunks_sent += 1
                 self.audio_chunks_sent += 1
                 
-                # Small delay to avoid overwhelming the WebSocket (simulate real-time playback)
-                await asyncio.sleep(chunk_duration_ms / 1000.0)
+                # Small delay to simulate real-time playback
+                # Using 95% of chunk duration for smoother streaming
+                await asyncio.sleep(chunk_duration_ms / 1000.0 * 0.95)
             
-            logger.info(f"✅ Sent {total_bytes} bytes in {chunks_sent} chunks ({total_bytes / (sample_rate * 2):.1f}s of audio)")
+            duration_sec = total_bytes / (sample_rate * 2)
+            logger.debug(f"✅ Sent {total_bytes} bytes in {chunks_sent} chunks ({duration_sec:.1f}s)")
             
         except Exception as e:
-            logger.error(f"Error sending audio: {e}", exc_info=True)
+            logger.error(f"Error sending audio: {e}", exc_info=False)
 
     def is_connected(self) -> bool:
         """Check if connected to an Attendee bot."""
