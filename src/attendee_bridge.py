@@ -178,6 +178,11 @@ class AttendeeBridge:
             chunks_sent = 0
             
             for i in range(0, total_bytes, chunk_size):
+                # Check for cancellation before sending each chunk
+                if asyncio.current_task().cancelled():
+                    logger.info("⏹️ Audio sending interrupted by cancellation")
+                    raise asyncio.CancelledError()
+                
                 chunk = pcm_data[i:i + chunk_size]
                 
                 # Create Attendee message for this chunk

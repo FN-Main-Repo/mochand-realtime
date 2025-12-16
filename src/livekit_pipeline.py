@@ -136,12 +136,17 @@ class LiveKitPipeline:
                 "content": user_text
             })
             
-            # Call Gemini via OpenRouter
+            # Call Gemini via OpenRouter with highest throughput routing
             response = await self.openrouter_client.chat.completions.create(
                 model="google/gemini-2.0-flash-001:online",
                 messages=self.messages,
                 max_tokens=500,
-                temperature=0.7
+                temperature=0.7,
+                extra_body={
+                    "provider": {
+                        "sort": "throughput"
+                    }
+                }
             )
             
             assistant_text = response.choices[0].message.content.strip()
@@ -179,6 +184,11 @@ class LiveKitPipeline:
         
     async def generate_response_streaming(self, user_text: str):
         """Stream LLM response and yield chunks for TTS with language detection."""
+        import time
+        
+        func_start = time.time()
+        logger.info(f"📥 generate_response_streaming called at {func_start}")
+        
         # Add user message to conversation history
         self.conversation_history.append({"role": "user", "content": user_text})
         
@@ -190,21 +200,44 @@ class LiveKitPipeline:
         if len(messages) > 7:
             messages = [messages[0]] + messages[-6:]
         
-        # Enable streaming
+        prep_done = time.time()
+        logger.info(f"⏱️ Message prep took {prep_done - func_start:.3f}s")
+        
+        # Enable streaming with highest throughput routing
+        logger.info("🚀 Calling OpenRouter API NOW...")
+        api_call_start = time.time()
+        
         stream = await self.openrouter_client.chat.completions.create(
             model="google/gemini-2.0-flash-001:online",
             messages=messages,
-            max_tokens=16000,
+            max_tokens=500,
             temperature=0.7,
-            stream=True
+            stream=True,
+            extra_body={
+                "provider": {
+                    "sort": "throughput"
+                }
+            }
         )
+        
+        api_call_end = time.time()
+        logger.info(f"⏱️ API call setup took {api_call_end - api_call_start:.3f}s")
         
         full_response = ""
         
+        first_chunk = True
         async for chunk in stream:
+            if first_chunk:
+                first_chunk_time = time.time()
+                logger.info(f"⏱️ First chunk received after {first_chunk_time - api_call_start:.3f}s")
+                first_chunk = False
+                
             if chunk.choices[0].delta.content:
                 token = chunk.choices[0].delta.content
                 full_response += token
+        
+        stream_done = time.time()
+        logger.info(f"⏱️ Full stream received in {stream_done - api_call_start:.3f}s")
         
         # Detect language using langdetect
         from langdetect import detect, LangDetectException
@@ -228,16 +261,19 @@ class LiveKitPipeline:
                 language_code = detected_lang
             else:
                 # Unsupported language, default to English
-                logger.info(f"🔍 Detected unsupported language '{detected_lang}', using English")
+                logger.info(f"🌍 Detected unsupported language '{detected_lang}', using English")
                 language_code = "en"
             
-            logger.info(f"🔍 Detected language: {language_code}")
+            logger.info(f"🌍 Detected language: {language_code}")
         except LangDetectException:
             logger.warning("Could not detect language, defaulting to English")
             language_code = "en"
         
         # Save to conversation history
         self.conversation_history.append({"role": "assistant", "content": full_response})
+        
+        yield_time = time.time()
+        logger.info(f"⏱️ Total time in generate_response_streaming: {yield_time - func_start:.3f}s")
         
         # Yield response text with language code
         yield {"text": full_response, "language": language_code}
@@ -342,17 +378,36 @@ class LiveKitPipeline:
         Yields:
             Audio PCM chunks as they're generated
         """
-        # Step 1: STT (still blocking, but fast with Whisper)
-        text = await self.transcribe_audio(audio_pcm, sample_rate)
+        import time
         
-        if not text:
+        # Step 1: STT (still blocking, but fast with Whisper)
+        stt_start = time.time()
+        logger.info(f"🎙️ Starting STT for {len(audio_pcm)} bytes of audio")
+        text = await self.transcribe_audio(audio_pcm, sample_rate)
+        stt_end = time.time()
+        logger.info(f"⏱️ STT took {stt_end - stt_start:.2f}s")
+        
+        if not text or len(text.strip()) < 2:
+            logger.warning(f"⚠️ No valid transcription (got: '{text}') - skipping")
             return
+        
+        logger.info(f"🎙️ STT successful: '{text[:50]}...'")
         
         # Step 2 & 3: Stream LLM → TTS
         # Get response with language detection from LLM
+        logger.info("🔄 Calling generate_response_streaming...")
+        llm_start = time.time()
+        
         async for response_data in self.generate_response_streaming(text):
-            response_text = response_data["text"]
-            language_code = response_data["language"]
+            llm_end = time.time()
+            logger.info(f"⏱️ Time from STT end to first LLM yield: {llm_end - stt_end:.2f}s")
+            
+            response_text = response_data.get("text", "")
+            language_code = response_data.get("language", "en")
+            
+            if not response_text or len(response_text.strip()) < 2:
+                logger.warning(f"⚠️ Empty or too short response text: '{response_text}'")
+                continue
             
             # Clean the text before TTS
             import re
@@ -361,8 +416,20 @@ class LiveKitPipeline:
             clean_text = re.sub(r'\b[a-zA-Z0-9-]+\.(com|org|net|io|dev|ai)\b', '', clean_text)
             clean_text = re.sub(r'\s+', ' ', clean_text).strip()
             
-            if clean_text:
-                logger.info(f"🔊 TTS chunk: {len(clean_text)} chars for '{clean_text[:100]}'")
-                # Convert to speech with detected language
-                audio_chunk = await self.synthesize_speech(clean_text, language_code)
-                yield audio_chunk
+            if not clean_text or len(clean_text) < 2:
+                logger.warning(f"⚠️ Text became empty after cleaning: '{response_text}'")
+                continue
+                
+            logger.info(f"📊 TTS chunk: {len(clean_text)} chars for '{clean_text[:100]}'")
+            
+            # Convert to speech with detected language
+            tts_start = time.time()
+            audio_chunk = await self.synthesize_speech(clean_text, language_code)
+            tts_end = time.time()
+            logger.info(f"⏱️ TTS took {tts_end - tts_start:.2f}s")
+            
+            if not audio_chunk or len(audio_chunk) < 1000:
+                logger.warning(f"⚠️ TTS produced empty/short audio ({len(audio_chunk) if audio_chunk else 0} bytes)")
+                continue
+                
+            yield audio_chunk

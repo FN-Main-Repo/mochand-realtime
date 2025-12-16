@@ -63,15 +63,16 @@ class MeetVoiceAgent:
         
         # State machine
         self.state = AgentState.IDLE
-        self.audio_buffer = bytearray()
         
-        # Output management (NO QUEUE - direct sending)
+        # VAD listening (ALWAYS ON - independent of bot state)
+        self.current_utterance_buffer = bytearray()  # Current speech being collected
+        self.is_interruption_utterance = False  # Flag: is current utterance just an interruption?
+        
+        # Output management
         self.current_audio_task: Optional[asyncio.Task] = None  # Track task for cancellation
         self.processing_task: Optional[asyncio.Task] = None  # Track utterance processing task
-        self.sender_task: Optional[asyncio.Task] = None  # Keep for backwards compat
         self.vad_processor_task: Optional[asyncio.Task] = None
         self.is_running = False  # Flag to prevent operations after cleanup
-        self.sender_active = False  # Track if audio sender is actively sending
         
         # Metrics
         self.metrics = {
@@ -130,6 +131,7 @@ class MeetVoiceAgent:
     async def _handle_vad_event(self, event):
         """
         Handle VAD events for speech detection.
+        VAD is ALWAYS listening, regardless of bot state.
         
         Args:
             event: VAD event from Silero
@@ -137,81 +139,74 @@ class MeetVoiceAgent:
         from livekit.agents import vad
         
         if event.type == vad.VADEventType.START_OF_SPEECH:
-            # START_OF_SPEECH includes prefix-padded frames - these contain the first words!
-            await self._on_speech_start(event)
+            # Start collecting new utterance (always, regardless of state)
+            self.metrics["speech_events"] += 1
+            self.current_utterance_buffer = bytearray()
+            
+            # Collect prefix-padded frames (contains first words!)
+            if event.frames:
+                for frame in event.frames:
+                    self.current_utterance_buffer.extend(frame.data)
+            
+            logger.info(f"🎤 User started speaking (bot state: {self.state.value})")
+            
+            # IMMEDIATE INTERRUPTION: If bot is busy, cancel it RIGHT NOW
+            # Mark this utterance as "interruption only" - don't process it
+            if self.state in [AgentState.PROCESSING, AgentState.BOT_SPEAKING]:
+                logger.info(f"🛑 IMMEDIATE interrupt - user speaking while bot {self.state.value}")
+                self.metrics["interruptions"] += 1
+                self.is_interruption_utterance = True  # Don't process this utterance
+                
+                # Cancel current audio sending immediately
+                if self.current_audio_task and not self.current_audio_task.done():
+                    self.current_audio_task.cancel()
+                    logger.debug("⏹️ Cancelled audio task")
+                
+                # Cancel processing task immediately
+                if self.processing_task and not self.processing_task.done():
+                    self.processing_task.cancel()
+                    logger.debug("⏹️ Cancelled processing task")
+                
+                # Reset to idle so bot stops immediately
+                self.state = AgentState.IDLE
+            else:
+                # Not an interruption - normal utterance
+                self.is_interruption_utterance = False
             
         elif event.type == vad.VADEventType.INFERENCE_DONE:
-            # Continue collecting speech frames during COLLECTING state
-            if self.state == AgentState.COLLECTING and event.frames:
+            # Continue collecting speech frames
+            if event.frames:
                 for frame in event.frames:
-                    self.audio_buffer.extend(frame.data)
+                    self.current_utterance_buffer.extend(frame.data)
             
         elif event.type == vad.VADEventType.END_OF_SPEECH:
-            await self._on_speech_end()
+            # Utterance complete - save it and trigger processing
+            await self._on_utterance_complete()
     
-    async def _on_speech_start(self, event):
-        """Handle start of speech event."""
-        self.metrics["speech_events"] += 1
-        
-        # Check if we need to interrupt ongoing processing/speaking
-        if self.sender_active or self.state in [AgentState.PROCESSING, AgentState.BOT_SPEAKING]:
-            # User interrupted the bot
-            logger.info("🛑 User interrupted bot - cancelling immediately")
-            self.metrics["interruptions"] += 1
-            
-            # IMMEDIATELY cancel current audio sending
-            if self.current_audio_task and not self.current_audio_task.done():
-                self.current_audio_task.cancel()
-                logger.info("⏹️ Cancelled audio task")
-            
-            # IMMEDIATELY cancel processing task (STT/LLM/TTS pipeline)
-            if self.processing_task and not self.processing_task.done():
-                self.processing_task.cancel()
-                logger.info("⏹️ Cancelled processing task")
-            
-            self.sender_active = False
-            
-            # Transition to collecting immediately
-            self.state = AgentState.COLLECTING
-            self.audio_buffer = bytearray()
-            
-            # Collect prefix-padded frames from VAD (contains first words!)
-            if event.frames:
-                for frame in event.frames:
-                    self.audio_buffer.extend(frame.data)
-            
-            logger.info("🎤 Speech started - collecting audio (interrupted bot)")
-            return
-        
-        # Start collecting speech from idle
-        if self.state == AgentState.IDLE:
-            logger.info("🎤 Speech started - collecting audio")
-            self.state = AgentState.COLLECTING
-            self.audio_buffer = bytearray()
-            
-            # CRITICAL: Collect prefix-padded frames from VAD
-            # These frames contain audio BEFORE speech detection (first words!)
-            if event.frames:
-                for frame in event.frames:
-                    self.audio_buffer.extend(frame.data)
-    
-    async def _on_speech_end(self):
-        """Handle end of speech event - process complete utterance."""
-        if self.state != AgentState.COLLECTING:
-            return
-        
-        utterance_audio = bytes(self.audio_buffer)
-        self.audio_buffer = bytearray()
+    async def _on_utterance_complete(self):
+        """
+        Called when VAD detects end of speech.
+        Utterance is complete - process it (bot was already interrupted at START if needed).
+        """
+        utterance_audio = bytes(self.current_utterance_buffer)
+        self.current_utterance_buffer = bytearray()
         
         duration_sec = len(utterance_audio) / (self.sample_rate * 2)
-        logger.info(f"🔇 Speech ended - collected {len(utterance_audio)} bytes ({duration_sec:.2f}s)")
+        logger.info(f"🔇 Utterance complete - {len(utterance_audio)} bytes ({duration_sec:.2f}s)")
         
-        if len(utterance_audio) < 3200:  # Less than 0.1s of audio
-            logger.debug("Utterance too short, ignoring")
-            self.state = AgentState.IDLE
+        # Check if this was just an interruption utterance (like "stop", "hindi me btao")
+        if self.is_interruption_utterance:
+            logger.info("⏭️ Ignoring interruption utterance - bot already stopped, waiting for next input")
+            self.is_interruption_utterance = False  # Reset flag
             return
         
-        # Process complete utterance in PARALLEL (don't await)
+        # Filter out very short noises/artifacts (min 200ms)
+        if len(utterance_audio) < 6400:  # ~200ms at 16kHz, 16-bit
+            logger.info(f"⚠️ Audio too short ({duration_sec:.2f}s), ignoring")
+            return
+        
+        # Process this utterance (interruption already happened at START_OF_SPEECH if needed)
+        logger.info("✅ Starting to process utterance")
         self.state = AgentState.PROCESSING
         self.processing_task = asyncio.create_task(self._process_complete_utterance(utterance_audio))
     
@@ -229,15 +224,13 @@ class MeetVoiceAgent:
             
             logger.info("🔄 Processing complete utterance through streaming pipeline")
             
-            # Use streaming pipeline - send audio IMMEDIATELY (no queue)
-            self.state = AgentState.BOT_SPEAKING
-            
+            # Keep state as PROCESSING until we actually start sending audio
             chunk_count = 0
             async for audio_chunk in self.pipeline.process_audio_streaming(audio_pcm, self.sample_rate):
-                # Check for interruption (state changed by _on_speech_start)
-                if self.state == AgentState.COLLECTING:
-                    logger.info("⏹️ Stopping response due to interruption")
-                    return  # Exit immediately, new speech is being collected
+                # Now we're actually speaking - update state
+                if chunk_count == 0:
+                    self.state = AgentState.BOT_SPEAKING
+                    logger.debug("🗣️ Started sending audio to meeting")
                 
                 # Send audio chunk IMMEDIATELY (no queue buffering)
                 self.current_audio_task = asyncio.create_task(
@@ -249,7 +242,8 @@ class MeetVoiceAgent:
                     chunk_count += 1
                 except asyncio.CancelledError:
                     logger.info("⏹️ Audio sending cancelled (user interrupted)")
-                    return  # Stop processing this response
+                    self.state = AgentState.IDLE
+                    return
             
             logger.info(f"✅ Sent {chunk_count} audio chunks")
             
@@ -268,15 +262,11 @@ class MeetVoiceAgent:
     
     async def _send_audio_chunk(self, audio_chunk: bytes):
         """Send a single audio chunk to the meeting."""
-        self.sender_active = True
-        
         if self.bridge:
             try:
                 await self.bridge.send_audio(audio_chunk, self.sample_rate)
             except Exception as e:
                 logger.error(f"Error sending audio chunk: {e}")
-        
-        self.sender_active = False
     
     def has_speech(self, audio_array: np.ndarray) -> bool:
         """
@@ -346,7 +336,7 @@ class MeetVoiceAgent:
             logger.info("Loading Silero VAD model...")
             self.vad_model = silero.VAD.load(
                 min_speech_duration=0.1,       # 100ms to catch first words faster
-                min_silence_duration=0.8,      # 800ms to handle natural pauses
+                min_silence_duration=1.5,      # 1500ms to handle natural pauses
                 prefix_padding_duration=0.5,   # 500ms padding to capture first words
                 max_buffered_speech=30.0,      # Max 30s utterance
                 activation_threshold=0.4,      # Sensitive detection
