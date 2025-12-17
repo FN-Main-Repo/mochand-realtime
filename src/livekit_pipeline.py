@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import io
+import re
 import numpy as np
 from typing import Optional
 from dotenv import load_dotenv
@@ -18,6 +19,47 @@ from langdetect import detect, LangDetectException
 load_dotenv(".env.local")
 
 logger = logging.getLogger("livekit-pipeline")
+
+
+def strip_markdown(text: str) -> str:
+    """Remove all markdown formatting from text before speaking."""
+    if not text:
+        return text
+
+    # Remove code blocks
+    text = re.sub(r"```[\s\S]*?```", "", text)
+
+    # Remove inline code
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+
+    # Remove images
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+
+    # Remove links but keep text
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+
+    # Remove headings
+    text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.MULTILINE)
+
+    # Remove blockquotes
+    text = re.sub(r"^\s{0,3}>\s?", "", text, flags=re.MULTILINE)
+
+    # Remove list markers
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+
+    # Remove emphasis markers
+    text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text)
+    text = re.sub(r"(\*|_)(.*?)\1", r"\2", text)
+
+    # Remove horizontal rules
+    text = re.sub(r"^-{3,}$", "", text, flags=re.MULTILINE)
+
+    # Normalize whitespace
+    text = re.sub(r"\n{2,}", "\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+
+    return text.strip()
 
 
 class LiveKitPipeline:
@@ -138,7 +180,7 @@ class LiveKitPipeline:
             
             # Call Gemini via OpenRouter with highest throughput routing
             response = await self.openrouter_client.chat.completions.create(
-                model="google/gemini-2.0-flash-001:online",
+                model="meta-llama/llama-3.3-70b-instruct",
                 messages=self.messages,
                 max_tokens=500,
                 temperature=0.7,
@@ -151,10 +193,9 @@ class LiveKitPipeline:
             
             assistant_text = response.choices[0].message.content.strip()
             
-            # CRITICAL: Strip markdown links and URLs before speaking
-            # Remove markdown links: [text](url) -> text
-            import re
-            clean_text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', assistant_text)
+            # CRITICAL: Strip ALL markdown formatting before speaking
+            clean_text = strip_markdown(assistant_text)
+            
             # Remove any remaining URLs
             clean_text = re.sub(r'https?://\S+', '', clean_text)
             # Remove website mentions like "accuweather.com"
@@ -208,7 +249,7 @@ class LiveKitPipeline:
         api_call_start = time.time()
         
         stream = await self.openrouter_client.chat.completions.create(
-            model="google/gemini-2.0-flash-001:online",
+            model="meta-llama/llama-3.3-70b-instruct:online",
             messages=messages,
             max_tokens=500,
             temperature=0.7,
@@ -409,11 +450,13 @@ class LiveKitPipeline:
                 logger.warning(f"⚠️ Empty or too short response text: '{response_text}'")
                 continue
             
-            # Clean the text before TTS
-            import re
-            clean_text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', response_text)
+            # Clean ALL markdown formatting before TTS
+            clean_text = strip_markdown(response_text)
+            # Remove any remaining URLs
             clean_text = re.sub(r'https?://\S+', '', clean_text)
+            # Remove website mentions
             clean_text = re.sub(r'\b[a-zA-Z0-9-]+\.(com|org|net|io|dev|ai)\b', '', clean_text)
+            # Clean up extra spaces
             clean_text = re.sub(r'\s+', ' ', clean_text).strip()
             
             if not clean_text or len(clean_text) < 2:
@@ -433,3 +476,118 @@ class LiveKitPipeline:
                 continue
                 
             yield audio_chunk
+    
+    async def process_audio_streaming_active(self, audio_pcm: bytes, sample_rate: int = 16000):
+        """
+        STREAMING pipeline for ACTIVE bot: Uses existing conversation_history 
+        (which already has the transcript from passive listening).
+        Only does LLM → TTS.
+        
+        Args:
+            audio_pcm: Input audio PCM bytes
+            sample_rate: Audio sample rate
+            
+        Yields:
+            Audio PCM chunks as they're generated
+        """
+        import time
+        
+        # Get the last user message from conversation_history
+        if not self.conversation_history or self.conversation_history[-1]["role"] != "user":
+            logger.warning("⚠️ No user message in history - cannot process")
+            return
+        
+        user_text = self.conversation_history[-1]["content"]
+        logger.info(f"🎙️ Processing existing transcript: '{user_text[:50]}...'")
+        
+        # Build messages: system prompt + current user message (even when history is disabled)
+        messages = self.messages.copy()  # Start with system prompt
+        # Add the current user message (always include this, even if history is disabled)
+        messages.append({"role": "user", "content": user_text})
+        # messages.extend(self.conversation_history)  # Add all conversation (last 6 messages) - COMMENTED OUT FOR TESTING
+        
+        # Stream LLM response
+        logger.info("🚀 Calling OpenRouter API...")
+        llm_start = time.time()
+        
+        stream = await self.openrouter_client.chat.completions.create(
+            model="meta-llama/llama-3.3-70b-instruct:online",
+            messages=messages,
+            max_tokens=500,
+            temperature=0.7,
+            stream=True,
+            extra_body={
+                "provider": {
+                    "sort": "throughput"
+                }
+            }
+        )
+        
+        full_response = ""
+        
+        first_chunk = True
+        async for chunk in stream:
+            if first_chunk:
+                first_chunk_time = time.time()
+                logger.info(f"⏱️ First chunk received after {first_chunk_time - llm_start:.3f}s")
+                first_chunk = False
+                
+            if chunk.choices[0].delta.content:
+                token = chunk.choices[0].delta.content
+                full_response += token
+        
+        stream_done = time.time()
+        logger.info(f"⏱️ Full stream received in {stream_done - llm_start:.3f}s")
+        
+        # Detect language
+        try:
+            detected_lang = detect(full_response)
+            
+            if detected_lang == 'zh':
+                detected_lang = 'zh-cn'
+            
+            supported_languages = {
+                "en", "hi", "ur", "bn", "mr", "ta", "te", "gu", "kn", "ml", "pa",
+                "es", "fr", "de", "pt", "it", "ja", "ko", "zh-cn", "zh-tw", "ar", "ru"
+            }
+            
+            if detected_lang in supported_languages:
+                language_code = detected_lang
+            else:
+                logger.info(f"🌍 Detected unsupported language '{detected_lang}', using English")
+                language_code = "en"
+            
+            logger.info(f"🌍 Detected language: {language_code}")
+        except LangDetectException:
+            logger.warning("Could not detect language, defaulting to English")
+            language_code = "en"
+        
+        # Save to conversation history
+        self.conversation_history.append({"role": "assistant", "content": full_response})
+        
+        # Clean ALL markdown formatting before TTS
+        clean_text = strip_markdown(full_response)
+        # Remove any remaining URLs
+        clean_text = re.sub(r'https?://\S+', '', clean_text)
+        # Remove website mentions
+        clean_text = re.sub(r'\b[a-zA-Z0-9-]+\.(com|org|net|io|dev|ai)\b', '', clean_text)
+        # Clean up extra spaces
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+        
+        if not clean_text or len(clean_text) < 2:
+            logger.warning(f"⚠️ Text became empty after cleaning: '{full_response}'")
+            return
+            
+        logger.info(f"📊 TTS: {len(clean_text)} chars for '{clean_text[:100]}'")
+        
+        # Convert to speech with detected language
+        tts_start = time.time()
+        audio_chunk = await self.synthesize_speech(clean_text, language_code)
+        tts_end = time.time()
+        logger.info(f"⏱️ TTS took {tts_end - tts_start:.2f}s")
+        
+        if not audio_chunk or len(audio_chunk) < 1000:
+            logger.warning(f"⚠️ TTS produced empty/short audio ({len(audio_chunk) if audio_chunk else 0} bytes)")
+            return
+            
+        yield audio_chunk

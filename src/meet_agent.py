@@ -66,7 +66,6 @@ class MeetVoiceAgent:
         
         # VAD listening (ALWAYS ON - independent of bot state)
         self.current_utterance_buffer = bytearray()  # Current speech being collected
-        self.is_interruption_utterance = False  # Flag: is current utterance just an interruption?
         
         # Output management
         self.current_audio_task: Optional[asyncio.Task] = None  # Track task for cancellation
@@ -81,6 +80,14 @@ class MeetVoiceAgent:
             "interruptions": 0,
             "total_turns": 0
         }
+        
+        # Jarvis detection patterns (English + Hindi + Urdu)
+        # Bot only responds when "jarvis" is mentioned anywhere in the query
+        self.jarvis_patterns = [
+            r"jarvis",                    # English
+            r"जार्विस",                   # Hindi
+            r"جارویس",                    # Urdu
+        ]
         
         logger.info("MeetVoiceAgent initialized - ready for VAD setup")
 
@@ -150,28 +157,25 @@ class MeetVoiceAgent:
             
             logger.info(f"🎤 User started speaking (bot state: {self.state.value})")
             
-            # IMMEDIATE INTERRUPTION: If bot is busy, cancel it RIGHT NOW
-            # Mark this utterance as "interruption only" - don't process it
-            if self.state in [AgentState.PROCESSING, AgentState.BOT_SPEAKING]:
-                logger.info(f"🛑 IMMEDIATE interrupt - user speaking while bot {self.state.value}")
+            # INTERRUPTION: Only interrupt when bot is actively SPEAKING
+            if self.state == AgentState.BOT_SPEAKING:
+                logger.info("🛑 IMMEDIATE interrupt - user speaking while bot is speaking")
                 self.metrics["interruptions"] += 1
-                self.is_interruption_utterance = True  # Don't process this utterance
                 
                 # Cancel current audio sending immediately
                 if self.current_audio_task and not self.current_audio_task.done():
                     self.current_audio_task.cancel()
                     logger.debug("⏹️ Cancelled audio task")
                 
-                # Cancel processing task immediately
+                # Cancel processing task if any
                 if self.processing_task and not self.processing_task.done():
                     self.processing_task.cancel()
                     logger.debug("⏹️ Cancelled processing task")
                 
                 # Reset to idle so bot stops immediately
                 self.state = AgentState.IDLE
-            else:
-                # Not an interruption - normal utterance
-                self.is_interruption_utterance = False
+            
+            # Always process utterance normally (no interruption flag)
             
         elif event.type == vad.VADEventType.INFERENCE_DONE:
             # Continue collecting speech frames
@@ -194,12 +198,6 @@ class MeetVoiceAgent:
         duration_sec = len(utterance_audio) / (self.sample_rate * 2)
         logger.info(f"🔇 Utterance complete - {len(utterance_audio)} bytes ({duration_sec:.2f}s)")
         
-        # Check if this was just an interruption utterance (like "stop", "hindi me btao")
-        if self.is_interruption_utterance:
-            logger.info("⏭️ Ignoring interruption utterance - bot already stopped, waiting for next input")
-            self.is_interruption_utterance = False  # Reset flag
-            return
-        
         # Filter out very short noises/artifacts (min 200ms)
         if len(utterance_audio) < 6400:  # ~200ms at 16kHz, 16-bit
             logger.info(f"⚠️ Audio too short ({duration_sec:.2f}s), ignoring")
@@ -212,25 +210,66 @@ class MeetVoiceAgent:
     
     async def _process_complete_utterance(self, audio_pcm: bytes):
         """
-        Process complete utterance through streaming STT → LLM → TTS pipeline.
-        Runs as background task, can be cancelled on interruption.
+        Process complete utterance: ALWAYS run STT to store context,
+        but only run LLM+TTS if bot is active.
         
         Args:
             audio_pcm: Complete utterance audio
         """
         try:
             self.metrics["utterances_processed"] += 1
+            
+            # STEP 1: ALWAYS transcribe (passive listening)
+            logger.info("🎙️ Transcribing utterance...")
+            
+            # Reset state to IDLE when processing new utterance (bot finished speaking)
+            if self.state == AgentState.BOT_SPEAKING:
+                logger.info("🔄 Bot was speaking, now processing new utterance - resetting to IDLE")
+                self.state = AgentState.IDLE
+            
+            transcript = await self.pipeline.transcribe_audio(audio_pcm, self.sample_rate)
+            
+            if not transcript or len(transcript.strip()) < 2:
+                logger.info("⚠️ No valid transcript, ignoring")
+                self.state = AgentState.IDLE
+                return
+            
+            # STEP 2: Store transcript in conversation history (ALWAYS)
+            self.pipeline.conversation_history.append({
+                "role": "user",
+                "content": transcript
+            })
+            
+            # Keep only last 6 user messages for context
+            if len(self.pipeline.conversation_history) > 6:
+                self.pipeline.conversation_history = self.pipeline.conversation_history[-6:]
+            
+            # STEP 3: Check if "jarvis" is mentioned in the transcript
+            import re
+            jarvis_detected = any(
+                re.search(pattern, transcript, re.IGNORECASE)
+                for pattern in self.jarvis_patterns
+            )
+            
+            if jarvis_detected:
+                logger.info(f"🟢 JARVIS DETECTED in: '{transcript}'")
+            else:
+                logger.info(f"💾 Stored (passive): '{transcript}' - no Jarvis mention")
+                self.state = AgentState.IDLE
+                return
+            
+            # STEP 4: Jarvis detected - process with LLM + TTS
+            logger.info("🔄 Processing through LLM pipeline")
             self.metrics["total_turns"] += 1
             
-            logger.info("🔄 Processing complete utterance through streaming pipeline")
-            
-            # Keep state as PROCESSING until we actually start sending audio
+            # Set state to BOT_SPEAKING before we start sending audio
+            # This ensures interruption works during the entire speaking duration
             chunk_count = 0
-            async for audio_chunk in self.pipeline.process_audio_streaming(audio_pcm, self.sample_rate):
-                # Now we're actually speaking - update state
+            async for audio_chunk in self.pipeline.process_audio_streaming_active(audio_pcm, self.sample_rate):
+                # Set state on first chunk
                 if chunk_count == 0:
                     self.state = AgentState.BOT_SPEAKING
-                    logger.debug("🗣️ Started sending audio to meeting")
+                    logger.info("🗣️ Bot started speaking - interruption enabled")
                 
                 # Send audio chunk IMMEDIATELY (no queue buffering)
                 self.current_audio_task = asyncio.create_task(
@@ -247,9 +286,10 @@ class MeetVoiceAgent:
             
             logger.info(f"✅ Sent {chunk_count} audio chunks")
             
-            # Return to idle after speaking (if not interrupted)
-            if self.state == AgentState.BOT_SPEAKING:
-                self.state = AgentState.IDLE
+            # Keep state as BOT_SPEAKING - don't reset to IDLE immediately
+            # State will be reset when next utterance is processed or on interruption
+            # This allows interruption during the entire audio playback duration
+            logger.info("🔊 Bot finished sending audio, still in BOT_SPEAKING state for interruption")
         
         except asyncio.CancelledError:
             logger.info("⏹️ Processing cancelled by user interruption")
@@ -262,11 +302,15 @@ class MeetVoiceAgent:
     
     async def _send_audio_chunk(self, audio_chunk: bytes):
         """Send a single audio chunk to the meeting."""
+        logger.info(f"📤 Sending audio chunk: {len(audio_chunk)} bytes (bot state: {self.state.value})")
         if self.bridge:
             try:
                 await self.bridge.send_audio(audio_chunk, self.sample_rate)
+                logger.info(f"✅ Audio chunk sent successfully (bot state: {self.state.value})")
             except Exception as e:
-                logger.error(f"Error sending audio chunk: {e}")
+                logger.error(f"❌ Error sending audio chunk: {e}")
+        else:
+            logger.warning("⚠️ No bridge available to send audio")
     
     def has_speech(self, audio_array: np.ndarray) -> bool:
         """
