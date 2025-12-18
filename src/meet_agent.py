@@ -6,7 +6,9 @@ Connects Attendee.dev WebSocket bridge with LiveKit voice agent.
 import asyncio
 import logging
 import os
+import re
 import sys
+import time
 from typing import Optional
 from enum import Enum
 from dotenv import load_dotenv
@@ -57,6 +59,12 @@ class MeetVoiceAgent:
         # LiveKit STT → LLM → TTS pipeline
         self.pipeline = LiveKitPipeline()
         
+        # Active listening mode (wake word activation)
+        self.is_active = False  # Bot only responds when active
+        self.active_timeout = 90  # Seconds of silence before deactivating
+        self.last_interaction_time: float = 0.0  # Timestamp of last interaction
+        self.activity_monitor_task: Optional[asyncio.Task] = None
+        
         # Silero VAD (initialized in start())
         self.vad_model: Optional[silero.VAD] = None
         self.vad_stream: Optional[silero.VADStream] = None
@@ -69,6 +77,7 @@ class MeetVoiceAgent:
         
         # Output management
         self.current_audio_task: Optional[asyncio.Task] = None  # Track task for cancellation
+        self.current_streaming_task: Optional[asyncio.Task] = None
         self.processing_task: Optional[asyncio.Task] = None  # Track utterance processing task
         self.vad_processor_task: Optional[asyncio.Task] = None
         self.is_running = False  # Flag to prevent operations after cleanup
@@ -78,7 +87,9 @@ class MeetVoiceAgent:
             "speech_events": 0,
             "utterances_processed": 0,
             "interruptions": 0,
-            "total_turns": 0
+            "total_turns": 0,
+            "wake_activations": 0,
+            "timeout_deactivations": 0
         }
         
         # Jarvis detection patterns (English + Hindi + Urdu)
@@ -86,10 +97,54 @@ class MeetVoiceAgent:
         self.jarvis_patterns = [
             r"jarvis",                    # English
             r"जार्विस",                   # Hindi
-            r"جارویس",                    # Urdu
+            r"جارویس",                    # Urdu,
+            r"جاروِس"
+            
         ]
         
         logger.info("MeetVoiceAgent initialized - ready for VAD setup")
+
+    def _activate_listening(self):
+        """Activate the bot for continuous listening."""
+        was_inactive = not self.is_active
+        self.is_active = True
+        self.last_interaction_time = time.time()
+        
+        if was_inactive:
+            self.metrics["wake_activations"] += 1
+            logger.info(f"🟢 JARVIS ACTIVATED - Listening for {self.active_timeout}s")
+        else:
+            logger.info(f"🔄 Activity refreshed - Timer reset to {self.active_timeout}s")
+    
+    def _deactivate_listening(self):
+        """Deactivate the bot - requires wake word to reactivate."""
+        if self.is_active:
+            self.is_active = False
+            self.metrics["timeout_deactivations"] += 1
+            logger.info("🔴 JARVIS DEACTIVATED - Say 'Jarvis' to wake me up")
+    
+    async def _activity_monitor_loop(self):
+        """Background task that monitors activity and deactivates after timeout."""
+        logger.info(f"⏱️ Activity monitor started (timeout: {self.active_timeout}s)")
+        
+        try:
+            while self.is_running:
+                await asyncio.sleep(1.0)  # Check every second
+                
+                if self.is_active:
+                    elapsed = time.time() - self.last_interaction_time
+                    remaining = self.active_timeout - elapsed
+                    
+                    if remaining <= 0:
+                        self._deactivate_listening()
+                    elif remaining <= 5:
+                        # Warn when about to deactivate
+                        logger.debug(f"⏱️ Deactivating in {remaining:.1f}s...")
+                        
+        except asyncio.CancelledError:
+            logger.info("Activity monitor cancelled")
+        except Exception as e:
+            logger.error(f"Activity monitor error: {e}", exc_info=True)
 
     async def audio_from_meet_callback(self, pcm_data: bytes, sample_rate: int):
         """
@@ -155,7 +210,7 @@ class MeetVoiceAgent:
                 for frame in event.frames:
                     self.current_utterance_buffer.extend(frame.data)
             
-            logger.info(f"🎤 User started speaking (bot state: {self.state.value})")
+            logger.info(f"🎤 User started speaking (bot state: {self.state.value}, active: {self.is_active})")
             
             # INTERRUPTION: Only interrupt when bot is actively SPEAKING
             if self.state == AgentState.BOT_SPEAKING:
@@ -211,94 +266,107 @@ class MeetVoiceAgent:
     async def _process_complete_utterance(self, audio_pcm: bytes):
         """
         Process complete utterance: ALWAYS run STT to store context,
-        but only run LLM+TTS if bot is active.
-        
-        Args:
-            audio_pcm: Complete utterance audio
+        but only run LLM+TTS if bot is active or wake word detected.
         """
+
         try:
             self.metrics["utterances_processed"] += 1
-            
-            # STEP 1: ALWAYS transcribe (passive listening)
+
             logger.info("🎙️ Transcribing utterance...")
-            
-            # Reset state to IDLE when processing new utterance (bot finished speaking)
+
+            # If bot was speaking, reset to IDLE
             if self.state == AgentState.BOT_SPEAKING:
-                logger.info("🔄 Bot was speaking, now processing new utterance - resetting to IDLE")
+                logger.info("🔄 Bot was speaking, resetting to IDLE")
                 self.state = AgentState.IDLE
-            
-            transcript = await self.pipeline.transcribe_audio(audio_pcm, self.sample_rate)
-            
+
+            transcript = await self.pipeline.transcribe_audio(
+                audio_pcm, self.sample_rate
+            )
+
             if not transcript or len(transcript.strip()) < 2:
-                logger.info("⚠️ No valid transcript, ignoring")
                 self.state = AgentState.IDLE
                 return
-            
-            # STEP 2: Store transcript in conversation history (ALWAYS)
-            self.pipeline.conversation_history.append({
-                "role": "user",
-                "content": transcript
-            })
-            
-            # Keep only last 6 user messages for context
-            if len(self.pipeline.conversation_history) > 6:
-                self.pipeline.conversation_history = self.pipeline.conversation_history[-6:]
-            
-            # STEP 3: Check if "jarvis" is mentioned in the transcript
-            import re
+
+            # Wake word detection
             jarvis_detected = any(
                 re.search(pattern, transcript, re.IGNORECASE)
                 for pattern in self.jarvis_patterns
             )
-            
+
+            should_respond = False
+
             if jarvis_detected:
-                logger.info(f"🟢 JARVIS DETECTED in: '{transcript}'")
+                logger.info(f"🟢 JARVIS DETECTED: '{transcript}'")
+                self._activate_listening()
+                should_respond = True
+
+            elif self.is_active:
+                logger.info(f"🎯 Active mode: '{transcript}'")
+                self._activate_listening()
+                should_respond = True
+
             else:
-                logger.info(f"💾 Stored (passive): '{transcript}' - no Jarvis mention")
+                logger.info(f"💤 Ignored: '{transcript}'")
                 self.state = AgentState.IDLE
                 return
-            
-            # STEP 4: Jarvis detected - process with LLM + TTS
+
+            if not should_respond:
+                self.state = AgentState.IDLE
+                return
+
             logger.info("🔄 Processing through LLM pipeline")
             self.metrics["total_turns"] += 1
-            
-            # Set state to BOT_SPEAKING before we start sending audio
-            # This ensures interruption works during the entire speaking duration
-            chunk_count = 0
-            async for audio_chunk in self.pipeline.process_audio_streaming_active(audio_pcm, self.sample_rate):
-                # Set state on first chunk
-                if chunk_count == 0:
-                    self.state = AgentState.BOT_SPEAKING
-                    logger.info("🗣️ Bot started speaking - interruption enabled")
-                
-                # Send audio chunk IMMEDIATELY (no queue buffering)
-                self.current_audio_task = asyncio.create_task(
-                    self._send_audio_chunk(audio_chunk)
-                )
-                
-                try:
+
+            # --------------------------------------------------
+            # 🔥 CRITICAL FIX: cancel any previous streaming task
+            # --------------------------------------------------
+            if self.current_streaming_task:
+                logger.info("🛑 Cancelling previous streaming task")
+                self.current_streaming_task.cancel()
+                self.current_streaming_task = None
+
+            async def _run_stream():
+                chunk_count = 0
+                async for audio_chunk in self.pipeline.process_audio_streaming_active(
+                    transcript
+                ):
+                    if chunk_count == 0:
+                        self.state = AgentState.BOT_SPEAKING
+                        logger.info("🗣️ Bot started speaking")
+
+                    # Send audio immediately
+                    self.current_audio_task = asyncio.create_task(
+                        self._send_audio_chunk(audio_chunk)
+                    )
+
                     await self.current_audio_task
                     chunk_count += 1
-                except asyncio.CancelledError:
-                    logger.info("⏹️ Audio sending cancelled (user interrupted)")
-                    self.state = AgentState.IDLE
-                    return
-            
-            logger.info(f"✅ Sent {chunk_count} audio chunks")
-            
-            # Keep state as BOT_SPEAKING - don't reset to IDLE immediately
-            # State will be reset when next utterance is processed or on interruption
-            # This allows interruption during the entire audio playback duration
-            logger.info("🔊 Bot finished sending audio, still in BOT_SPEAKING state for interruption")
-        
+
+                logger.info(f"✅ Sent {chunk_count} audio chunks")
+
+            # --------------------------------------------------
+            # Start streaming as a cancellable task
+            # --------------------------------------------------
+            self.current_streaming_task = asyncio.create_task(_run_stream())
+            await self.current_streaming_task
+
+            self._activate_listening()
+            logger.info("🔊 Bot finished speaking")
+
         except asyncio.CancelledError:
-            logger.info("⏹️ Processing cancelled by user interruption")
+            logger.info("⏹️ Utterance processing cancelled")
+
+            if self.current_streaming_task:
+                self.current_streaming_task.cancel()
+                self.current_streaming_task = None
+
             self.state = AgentState.IDLE
-            raise  # Re-raise to properly cancel the task
-                
+            raise
+
         except Exception as e:
-            logger.error(f"Error processing utterance: {e}", exc_info=True)
+            logger.error(f"❌ Error processing utterance: {e}", exc_info=True)
             self.state = AgentState.IDLE
+
     
     async def _send_audio_chunk(self, audio_chunk: bytes):
         """Send a single audio chunk to the meeting."""
@@ -408,6 +476,10 @@ class MeetVoiceAgent:
             self.vad_processor_task = asyncio.create_task(self._vad_processor_task())
             logger.info("✓ Background VAD processor started\n")
             
+            # Start activity monitor task
+            self.activity_monitor_task = asyncio.create_task(self._activity_monitor_loop())
+            logger.info(f"✓ Activity monitor started (timeout: {self.active_timeout}s)\n")
+            
             # Step 1: Start WebSocket server
             logger.info("=" * 60)
             logger.info("STEP 1: Starting WebSocket Server")
@@ -466,7 +538,7 @@ class MeetVoiceAgent:
             logger.info("STEP 4: Voice Agent Running")
             logger.info("=" * 60)
             logger.info("\n🎤 The bot is now in the meeting!")
-            logger.info("🔊 Try speaking in the meeting...")
+            logger.info(f"💤 Say 'Jarvis' to activate (listens for {self.active_timeout}s after activation)")
             logger.info("📊 Watch the logs below for audio activity\n")
             logger.info("Press Ctrl+C to stop\n")
             
@@ -492,6 +564,16 @@ class MeetVoiceAgent:
         # Stop accepting new audio immediately
         self.is_running = False
         await asyncio.sleep(0.1)  # Brief pause for in-flight operations
+        
+        # Stop activity monitor task
+        if self.activity_monitor_task:
+            try:
+                self.activity_monitor_task.cancel()
+                await asyncio.wait_for(self.activity_monitor_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            except Exception as e:
+                logger.error(f"Error stopping activity monitor: {e}")
         
         # Stop VAD processor task
         if self.vad_processor_task:
