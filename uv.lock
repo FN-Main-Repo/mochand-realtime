@@ -28,6 +28,7 @@ dependencies = [
     { name = "openai" },
     { name = "python-dotenv" },
     { name = "sentence-transformers" },
+    { name = "websocket-client" },
     { name = "websockets" },
 ]
 
@@ -52,6 +53,7 @@ requires-dist = [
     { name = "openai", specifier = ">=1.0.0" },
     { name = "python-dotenv" },
     { name = "sentence-transformers", specifier = ">=5.1.2" },
+    { name = "websocket-client", specifier = ">=1.6.0" },
     { name = "websockets", specifier = ">=12.0" },
 ]
 
@@ -4562,6 +4564,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/43/d7e8b71f6c21ff813ee8da1006f89b6c7fff047fb4c8b16ceb5e840599c5/watchfiles-1.1.1-pp39-pypy39_pp73-macosx_11_0_arm64.whl", hash = "sha256:3dbd8cbadd46984f802f6d479b7e3afa86c42d13e8f0f322d669d79722c8ec34", size = 397286, upload-time = "2025-10-14T15:06:16.177Z" },
     { url = "https://files.pythonhosted.org/packages/1f/5d/884074a5269317e75bd0b915644b702b89de73e61a8a7446e2b225f45b1f/watchfiles-1.1.1-pp39-pypy39_pp73-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:5524298e3827105b61951a29c3512deb9578586abf3a7c5da4a8069df247cccc", size = 451768, upload-time = "2025-10-14T15:06:18.266Z" },
     { url = "https://files.pythonhosted.org/packages/17/71/7ffcaa9b5e8961a25026058058c62ec8f604d2a6e8e1e94bee8a09e1593f/watchfiles-1.1.1-pp39-pypy39_pp73-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4b943d3668d61cfa528eb949577479d3b077fd25fb83c641235437bc0b5bc60e", size = 458561, upload-time = "2025-10-14T15:06:19.323Z" },
+]
+
+[[package]]
+name = "websocket-client"
+version = "1.9.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2c/41/aa4bf9664e4cda14c3b39865b12251e8e7d239f4cd0e3cc1b6c2ccde25c1/websocket_client-1.9.0.tar.gz", hash = "sha256:9e813624b6eb619999a97dc7958469217c3176312b3a16a4bd1bc7e08a46ec98", size = 70576, upload-time = "2025-10-07T21:16:36.495Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/34/db/b10e48aa8fff7407e67470363eac595018441cf32d5e1001567a7aeba5d2/websocket_client-1.9.0-py3-none-any.whl", hash = "sha256:af248a825037ef591efbf6ed20cc5faa03d3b47b9e5a2230a529eeee1c1fc3ef", size = 82616, upload-time = "2025-10-07T21:16:34.951Z" },
 ]
 
 [[package]]

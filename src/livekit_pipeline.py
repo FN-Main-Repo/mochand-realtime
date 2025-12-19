@@ -11,9 +11,14 @@ import struct
 from collections import deque
 import re
 import time
+import json
+import threading
+import urllib.parse
 from typing import Optional, AsyncGenerator
 
 import wave
+import websocket
+import numpy as np
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from google.cloud import texttospeech
@@ -167,12 +172,15 @@ class LiveKitPipeline:
 
     SYSTEM_PROMPT = """You are Jarvis, an intelligent AI assistant in a professional Google Meet call.
 
+YOUR NAME: Your name is Jarvis. When users address you as "Jarvis", they are calling you - it's NOT part of their question.
+
 INSTRUCTIONS:
 - Respond in the SAME language as the user speaks
 - Be professional, helpful, and comprehensive
 - For complex questions, provide thorough explanations
 - For simple questions, keep it concise
 - Maintain conversation context
+- When users say "Jarvis" followed by a question, ignore "Jarvis" and answer only the question
 
 NEVER include:
 ❌ URLs, links, web addresses, website names
@@ -194,6 +202,17 @@ Provide natural, conversational responses in the user's language."""
         self.tts_client = texttospeech.TextToSpeechClient.from_service_account_file(
             os.getenv("GOOGLE_CREDENTIALS_FILE")
         )
+        
+        # Fireworks AI Streaming ASR v2 configuration
+        self.fireworks_api_key = os.getenv("FIREWORKS_API_KEY")
+        self.fireworks_ws = None  # Persistent WebSocket connection
+        self.fireworks_ws_lock = threading.Lock()
+        self.use_fireworks_primary = bool(self.fireworks_api_key)
+        self._last_segment_id = -1  # Track last processed segment to get only new ones
+        
+        # Initialize Fireworks WebSocket if configured
+        if self.use_fireworks_primary:
+            self._init_fireworks_ws()
 
         self.tts_audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.LINEAR16,
@@ -209,10 +228,10 @@ Provide natural, conversational responses in the user's language."""
         self._summary_task: Optional[asyncio.Task] = None
         self._summary_lock = asyncio.Lock()
 
-        self.messages: deque = deque(
-            [{"role": "system", "content": self.SYSTEM_PROMPT}],
-            maxlen=6
-        )
+        # Keep system prompt separate from conversation history
+        self.system_prompt = self.SYSTEM_PROMPT
+        # Only user/assistant messages in deque (last 6 messages = 3 turns)
+        self.messages: deque = deque(maxlen=6)
 
         # Audio smoother for crossfading
         self.audio_smoother = AudioSmoother(sample_rate=16000, crossfade_ms=30)
@@ -309,11 +328,216 @@ Provide natural, conversational responses in the user's language."""
             return "en"
 
     # ------------------------------------------------------------------
+    # Fireworks WebSocket Management
+    # ------------------------------------------------------------------
+
+    def _init_fireworks_ws(self):
+        """Initialize persistent Fireworks WebSocket connection."""
+        try:
+            # Close existing connection if any
+            if self.fireworks_ws:
+                try:
+                    self.fireworks_ws.close()
+                except Exception:
+                    pass
+                self.fireworks_ws = None
+            
+            # Build URL with timestamp_granularities for segment tracking
+            # NOTE: timestamp_granularities needs to be added as separate params (not URL encoded)
+            ws_url = f"wss://audio-streaming-v2.api.fireworks.ai/v1/audio/transcriptions/streaming?authorization=Bearer%20{self.fireworks_api_key}&timestamp_granularities=word&timestamp_granularities=segment"
+            
+            logger.info(f"🔵 Fireworks WebSocket URL: {ws_url[:100]}...")
+            
+            # Reset segment tracking on new connection
+            self._last_segment_id = -1
+            
+            self.fireworks_ws = websocket.create_connection(ws_url, timeout=30)
+            self.fireworks_ws_url = ws_url  # Store for reconnection
+            logger.info("✓ Fireworks WebSocket connected")
+        except Exception as e:
+            logger.error(f"Failed to connect to Fireworks: {e}")
+            self.fireworks_ws = None
+            self.fireworks_ws_url = None
+
+    def _ensure_fireworks_ws(self):
+        """Ensure Fireworks WebSocket is connected."""
+        with self.fireworks_ws_lock:
+            try:
+                if self.fireworks_ws is None or not self.fireworks_ws.connected:
+                    self._init_fireworks_ws()
+            except Exception:
+                self._init_fireworks_ws()
+
+    # ------------------------------------------------------------------
     # STT
     # ------------------------------------------------------------------
 
-    async def transcribe_audio(self, audio_pcm: bytes, sample_rate: int = 16000) -> Optional[str]:
-        """Transcribe audio using OpenAI Whisper."""
+    async def _transcribe_with_fireworks(self, audio_pcm: bytes, sample_rate: int = 16000) -> Optional[str]:
+        """Transcribe audio using Fireworks AI Streaming ASR v2 - uses PERSISTENT WebSocket."""
+        try:
+            # Ensure WebSocket is connected
+            self._ensure_fireworks_ws()
+            
+            if not self.fireworks_ws:
+                logger.warning("🔴 Fireworks WebSocket is None")
+                return None
+            
+            try:
+                is_connected = self.fireworks_ws.connected
+            except Exception as conn_check_err:
+                logger.warning(f"🔴 Fireworks WebSocket connection check failed: {conn_check_err}")
+                self._init_fireworks_ws()
+                if not self.fireworks_ws:
+                    return None
+                is_connected = True
+            
+            if not is_connected:
+                logger.warning("🔴 Fireworks WebSocket not connected, reconnecting...")
+                self._init_fireworks_ws()
+                if not self.fireworks_ws:
+                    return None
+            
+            audio_duration_sec = len(audio_pcm) / (sample_rate * 2)
+            logger.info(f"🔵 Fireworks: Processing {len(audio_pcm)} bytes ({audio_duration_sec:.2f}s)")
+            
+            # Collect ALL segments from responses
+            all_segments = {}  # seg_id -> seg_text
+            response_count = 0
+            
+            with self.fireworks_ws_lock:
+                # Send audio in chunks (200ms)
+                chunk_size = int(sample_rate * 0.2) * 2  # 200ms in bytes
+                chunks_sent = 0
+                
+                try:
+                    for i in range(0, len(audio_pcm), chunk_size):
+                        chunk = audio_pcm[i:i + chunk_size]
+                        self.fireworks_ws.send_binary(chunk)
+                        chunks_sent += 1
+                    
+                    # CRITICAL: Send empty frame to signal end of utterance
+                    # This tells Fireworks to finalize the current segment
+                    self.fireworks_ws.send_binary(b'')
+                    logger.info(f"🔵 Fireworks: Sent {chunks_sent} audio chunks + end-of-utterance signal")
+                except Exception as send_err:
+                    logger.warning(f"🔴 WebSocket send failed: {send_err}, reconnecting...")
+                    # Reconnect and retry once
+                    self._init_fireworks_ws()
+                    if not self.fireworks_ws:
+                        logger.error("🔴 Fireworks reconnection failed")
+                        return None
+                    chunks_sent = 0
+                    for i in range(0, len(audio_pcm), chunk_size):
+                        chunk = audio_pcm[i:i + chunk_size]
+                        self.fireworks_ws.send_binary(chunk)
+                        chunks_sent += 1
+                    # Send end-of-utterance signal on retry too
+                    self.fireworks_ws.send_binary(b'')
+                    logger.info(f"🔵 Fireworks: Retry sent {chunks_sent} audio chunks + end-of-utterance signal")
+                
+                # Wait briefly for responses
+                time.sleep(0.5)
+                
+                # Collect all transcription responses
+                try:
+                    while True:
+                        self.fireworks_ws.settimeout(0.1)  # 100ms timeout
+                        response = self.fireworks_ws.recv()
+                        if not response:
+                            logger.warning("🟡 Fireworks: Empty response received")
+                            break
+                        
+                        response_count += 1
+                        data = json.loads(response)
+                        logger.debug(f"🔵 Fireworks response #{response_count}: {data}")
+                        
+                        if "error" in data:
+                            logger.error(f"🔴 Fireworks API error: {data['error']}")
+                            return None  # Return None on API error
+                        
+                        if "segments" in data:
+                            for seg in data["segments"]:
+                                seg_id = seg.get("id", 0)
+                                seg_text = seg.get("text", "").strip()
+                                if seg_text:
+                                    all_segments[seg_id] = seg_text
+                                    logger.debug(f"🔵 Segment[{seg_id}]: '{seg_text}'")
+                except Exception as recv_err:
+                    err_str = str(recv_err).lower()
+                    if "timed out" not in err_str:
+                        logger.warning(f"🟡 Fireworks recv exception: {recv_err}")
+            
+            # Log what we got
+            logger.info(f"🔵 Fireworks: Received {response_count} responses, {len(all_segments)} unique segments")
+            
+            if not all_segments:
+                logger.warning("🟡 Fireworks: No segments received at all")
+                return None
+            
+            # SIMPLIFIED APPROACH: Just use segments NEWER than last_segment_id
+            # If no new segments exist, the persistent connection accumulated old ones
+            sorted_ids = sorted(all_segments.keys())
+            max_segment_id = max(sorted_ids)
+            
+            logger.info(f"🔵 Fireworks: All segments: {dict(sorted(all_segments.items()))}")
+            logger.info(f"🔵 Fireworks: Segment ID range: {min(sorted_ids)} to {max_segment_id}, last_processed={self._last_segment_id}")
+            
+            # Get only NEW segments (ID > last_segment_id)
+            new_segment_ids = [sid for sid in sorted_ids if sid > self._last_segment_id]
+            
+            if new_segment_ids:
+                # We have new segments - use them
+                new_texts = [all_segments[sid] for sid in new_segment_ids]
+                text = " ".join(new_texts).strip()
+                
+                # Update last_segment_id
+                old_id = self._last_segment_id
+                self._last_segment_id = max_segment_id
+                logger.info(f"🟢 Fireworks: New segments found {new_segment_ids}")
+                logger.info(f"🔵 Fireworks: Updated last_segment_id: {old_id} -> {self._last_segment_id}")
+                
+                if text:
+                    logger.info(f"🎤 STT (Fireworks): '{text}'")
+                    return text
+                else:
+                    logger.warning(f"🟡 Fireworks: New segments but empty text after join")
+                    return None
+            else:
+                # No new segments - this is the problem case
+                # The persistent WebSocket is returning OLD segments from previous utterances
+                logger.warning(f"🟡 Fireworks: No new segments found (last_processed={self._last_segment_id}, max_received={max_segment_id})")
+                
+                # SOLUTION: If max_segment_id == last_segment_id, this is accumulated old data
+                # We should return None and let it fall back, OR reset the segment counter
+                
+                # Check if this looks like a segment ID reset (max < last)
+                if max_segment_id < self._last_segment_id:
+                    logger.info(f"🔵 Fireworks: Segment ID reset detected (max={max_segment_id} < last={self._last_segment_id})")
+                    # Use the latest segment after reset
+                    self._last_segment_id = max_segment_id
+                    text = all_segments[max_segment_id].strip()
+                    if text:
+                        logger.info(f"🎤 STT (Fireworks): '{text}' (from reset)")
+                        return text
+                
+                # Otherwise, these are old accumulated segments - return None
+                logger.warning(f"🔴 Fireworks FAILURE REASON: Received only old segments (already processed)")
+                return None
+            
+        except Exception as e:
+            logger.error(f"🔴 Fireworks STT error: {e}", exc_info=True)
+            # Reconnect on error
+            with self.fireworks_ws_lock:
+                if self.fireworks_ws:
+                    try:
+                        self.fireworks_ws.close()
+                    except:
+                        pass
+                self.fireworks_ws = None
+            return None
+
+    async def _transcribe_with_openai(self, audio_pcm: bytes, sample_rate: int = 16000) -> Optional[str]:
+        """Transcribe audio using OpenAI Whisper (fallback)."""
         try:
             wav_buffer = io.BytesIO()
             with wave.open(wav_buffer, 'wb') as wav_file:
@@ -332,14 +556,26 @@ Provide natural, conversational responses in the user's language."""
 
             text = transcript.text.strip()
             if text:
-                logger.info(f"🎤 STT: '{text}'")
+                logger.info(f"🎤 STT (OpenAI fallback): '{text}'")
                 return text
 
             return None
 
         except Exception as e:
-            logger.error(f"STT error: {e}", exc_info=True)
+            logger.error(f"OpenAI STT error: {e}", exc_info=True)
             return None
+
+    async def transcribe_audio(self, audio_pcm: bytes, sample_rate: int = 16000) -> Optional[str]:
+        """Transcribe audio using Fireworks AI (primary) with OpenAI fallback."""
+        # Try Fireworks first if configured
+        if self.use_fireworks_primary:
+            text = await self._transcribe_with_fireworks(audio_pcm, sample_rate)
+            if text:
+                return text
+            logger.warning("Fireworks STT failed, falling back to OpenAI")
+        
+        # Fallback to OpenAI
+        return await self._transcribe_with_openai(audio_pcm, sample_rate)
 
     # ------------------------------------------------------------------
     # LLM
@@ -350,9 +586,13 @@ Provide natural, conversational responses in the user's language."""
         try:
             self.messages.append({"role": "user", "content": user_text})
 
+            # Build messages: system prompt + chat history
+            api_messages = [{"role": "system", "content": self.system_prompt}]
+            api_messages.extend(list(self.messages))
+
             response = await self.openrouter_client.chat.completions.create(
                 model="meta-llama/llama-3.3-70b-instruct",
-                messages=list(self.messages),
+                messages=api_messages,
                 max_tokens=500,
                 temperature=0.7,
             )
@@ -473,14 +713,19 @@ Provide natural, conversational responses in the user's language."""
         voice_name, language_code = self._select_voice_for_language(language_code)
         logger.info(f"🌍 Language: {language_code}, Voice: {voice_name}")
 
-        # 2. Build message context
+        # 2. Build message context: system prompt + chat history
         self.messages.append({"role": "user", "content": user_text})
 
-        messages = list(self.messages)
-        messages.append({
-            "role": "user",
-            "content": f"Previous conversation: {self.conversation_summary}\n\nCurrent query: {user_text}"
-        })
+        # Always start with system prompt, then add conversation history
+        messages = [{"role": "system", "content": self.system_prompt}]
+        messages.extend(list(self.messages))
+        
+        # Add summary context if available
+        if self.conversation_summary:
+            messages.append({
+                "role": "user",
+                "content": f"Previous conversation: {self.conversation_summary}\n\nCurrent query: {user_text}"
+            })
 
         # 3. Open LLM stream
         logger.info("🚀 Opening LLM stream")
@@ -593,11 +838,15 @@ Provide natural, conversational responses in the user's language."""
 
         self.messages.append({"role": "user", "content": user_text})
 
-        messages = list(self.messages)
-        messages.append({
-            "role": "user",
-            "content": f"Previous conversation: {self.conversation_summary}\n\nCurrent query: {user_text}"
-        })
+        # System prompt + chat history
+        messages = [{"role": "system", "content": self.system_prompt}]
+        messages.extend(list(self.messages))
+        
+        if self.conversation_summary:
+            messages.append({
+                "role": "user",
+                "content": f"Previous conversation: {self.conversation_summary}\n\nCurrent query: {user_text}"
+            })
 
         # Collect full response
         llm_start = time.time()
@@ -703,11 +952,15 @@ Provide natural, conversational responses in the user's language."""
 
         self.messages.append({"role": "user", "content": user_text})
 
-        messages = list(self.messages)
-        messages.append({
-            "role": "user",
-            "content": f"Previous conversation: {self.conversation_summary}\n\nCurrent query: {user_text}"
-        })
+        # System prompt + chat history
+        messages = [{"role": "system", "content": self.system_prompt}]
+        messages.extend(list(self.messages))
+        
+        if self.conversation_summary:
+            messages.append({
+                "role": "user",
+                "content": f"Previous conversation: {self.conversation_summary}\n\nCurrent query: {user_text}"
+            })
 
         text_queue: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=5)
         audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=3)

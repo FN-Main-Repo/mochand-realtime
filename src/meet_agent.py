@@ -61,7 +61,7 @@ class MeetVoiceAgent:
         
         # Active listening mode (wake word activation)
         self.is_active = False  # Bot only responds when active
-        self.active_timeout = 90  # Seconds of silence before deactivating
+        self.active_timeout = 30  # Seconds of silence before deactivating
         self.last_interaction_time: float = 0.0  # Timestamp of last interaction
         self.activity_monitor_task: Optional[asyncio.Task] = None
         
@@ -100,6 +100,16 @@ class MeetVoiceAgent:
             r"جارویس",                    # Urdu,
             r"جاروِس"
             
+        ]
+        
+        # Stop Jarvis patterns (deactivation commands)
+        self.stop_patterns = [
+            r"stop\s+jarvis",             # English: "stop jarvis"
+            r"jarvis\s+stop",             # English: "jarvis stop"
+            r"band\s+karo\s+jarvis",     # Hindi: "band karo jarvis"
+            r"jarvis\s+band\s+karo",     # Hindi: "jarvis band karo"
+            r"rukh\s+jao\s+jarvis",      # Hindi: "rukh jao jarvis"
+            r"jarvis\s+rukh\s+jao",      # Hindi: "jarvis rukh jao"
         ]
         
         logger.info("MeetVoiceAgent initialized - ready for VAD setup")
@@ -287,6 +297,18 @@ class MeetVoiceAgent:
                 self.state = AgentState.IDLE
                 return
 
+            # Stop command detection (check FIRST before wake word)
+            stop_detected = any(
+                re.search(pattern, transcript, re.IGNORECASE)
+                for pattern in self.stop_patterns
+            )
+            
+            if stop_detected:
+                logger.info(f"🛑 STOP COMMAND DETECTED: '{transcript}'")
+                self._deactivate_listening()
+                self.state = AgentState.IDLE
+                return
+            
             # Wake word detection
             jarvis_detected = any(
                 re.search(pattern, transcript, re.IGNORECASE)
