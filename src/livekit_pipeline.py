@@ -1,20 +1,25 @@
 """
 LiveKit Pipeline for STT → LLM → TTS processing.
-Standalone pipeline that can be used without a LiveKit room.
+Optimized for smooth, natural-sounding audio output.
 """
 
 import asyncio
 import logging
 import os
 import io
+import struct
+from collections import deque
 import re
-import numpy as np
-from typing import Optional
+import time
+from typing import Optional, AsyncGenerator
+
+import wave
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from google.cloud import texttospeech
-import wave
 from langdetect import detect, LangDetectException
+
+from summarise_agent import summarize_text
 
 load_dotenv(".env.local")
 
@@ -26,570 +31,807 @@ def strip_markdown(text: str) -> str:
     if not text:
         return text
 
-    # Remove code blocks
     text = re.sub(r"```[\s\S]*?```", "", text)
-
-    # Remove inline code
     text = re.sub(r"`([^`]*)`", r"\1", text)
-
-    # Remove images
     text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
-
-    # Remove links but keep text
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-
-    # Remove headings
     text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.MULTILINE)
-
-    # Remove blockquotes
     text = re.sub(r"^\s{0,3}>\s?", "", text, flags=re.MULTILINE)
-
-    # Remove list markers
     text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
-
-    # Remove emphasis markers
     text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text)
     text = re.sub(r"(\*|_)(.*?)\1", r"\2", text)
-
-    # Remove horizontal rules
     text = re.sub(r"^-{3,}$", "", text, flags=re.MULTILINE)
-
-    # Normalize whitespace
     text = re.sub(r"\n{2,}", "\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
 
     return text.strip()
 
 
+class AudioSmoother:
+    """
+    Handles audio crossfading and smoothing between chunks.
+    Eliminates clicks/pops at chunk boundaries.
+    """
+    
+    def __init__(self, sample_rate: int = 16000, crossfade_ms: int = 30):
+        self.sample_rate = sample_rate
+        self.crossfade_samples = int(sample_rate * crossfade_ms / 1000)
+        self.previous_tail: Optional[bytes] = None
+    
+    def _bytes_to_samples(self, audio_bytes: bytes) -> list[int]:
+        """Convert PCM bytes to list of 16-bit samples."""
+        return list(struct.unpack(f'<{len(audio_bytes)//2}h', audio_bytes))
+    
+    def _samples_to_bytes(self, samples: list[int]) -> bytes:
+        """Convert list of samples back to PCM bytes."""
+        # Clamp to 16-bit range
+        clamped = [max(-32768, min(32767, int(s))) for s in samples]
+        return struct.pack(f'<{len(clamped)}h', *clamped)
+    
+    def process(self, audio_chunk: bytes) -> bytes:
+        """
+        Process audio chunk with crossfade from previous chunk.
+        Call this sequentially for each chunk.
+        """
+        if len(audio_chunk) < self.crossfade_samples * 4:
+            # Chunk too small for crossfade, return as-is
+            return audio_chunk
+        
+        samples = self._bytes_to_samples(audio_chunk)
+        
+        # Apply fade-in to start
+        for i in range(min(self.crossfade_samples, len(samples))):
+            fade = i / self.crossfade_samples
+            samples[i] = int(samples[i] * fade)
+        
+        # Crossfade with previous tail if available
+        if self.previous_tail:
+            tail_samples = self._bytes_to_samples(self.previous_tail)
+            for i in range(min(len(tail_samples), len(samples), self.crossfade_samples)):
+                # Blend previous tail (fading out) with current (fading in)
+                fade_out = 1.0 - (i / self.crossfade_samples)
+                fade_in = i / self.crossfade_samples
+                samples[i] = int(tail_samples[i] * fade_out + samples[i] * fade_in)
+        
+        # Store tail for next chunk (with fade-out applied)
+        if len(samples) > self.crossfade_samples:
+            tail = samples[-self.crossfade_samples:]
+            for i in range(len(tail)):
+                fade = 1.0 - (i / len(tail))
+                tail[i] = int(tail[i] * fade)
+            self.previous_tail = self._samples_to_bytes(tail)
+            
+            # Return without the tail (will be crossfaded into next chunk)
+            output = samples[:-self.crossfade_samples // 2]
+        else:
+            self.previous_tail = None
+            output = samples
+        
+        return self._samples_to_bytes(output)
+    
+    def flush(self) -> Optional[bytes]:
+        """Return any remaining audio (call after last chunk)."""
+        if self.previous_tail:
+            tail = self.previous_tail
+            self.previous_tail = None
+            return tail
+        return None
+    
+    def reset(self):
+        """Reset state for new utterance."""
+        self.previous_tail = None
+
+
 class LiveKitPipeline:
     """
     Standalone LiveKit-style pipeline for voice processing.
-    
     Flow: Audio (PCM) → STT → LLM → TTS → Audio (PCM)
     """
-    
+
+    # Chunking configuration - LARGER chunks for smoother audio
+    MIN_CHUNK_LENGTH = 100      # Increased from 50
+    MAX_CHUNK_LENGTH = 300      # Increased from 180
+    IDEAL_CHUNK_LENGTH = 200    # Target size
+    MIN_AUDIO_SIZE = 1000
+
+    SUPPORTED_LANGUAGES = {
+        "en", "hi", "ur", "bn", "mr", "ta", "te", "gu", "kn", "ml", "pa",
+        "es", "fr", "de", "pt", "it", "ja", "ko", "zh-cn", "zh-tw", "ar", "ru"
+    }
+
+    VOICE_MAP = {
+        "en": ("en-IN-Standard-A", "en-IN"),
+        "hi": ("hi-IN-Standard-A", "hi-IN"),
+        "ur": ("ur-IN-Standard-A", "ur-IN"),
+        "bn": ("bn-IN-Standard-A", "bn-IN"),
+        "mr": ("mr-IN-Standard-A", "mr-IN"),
+        "ta": ("ta-IN-Standard-A", "ta-IN"),
+        "te": ("te-IN-Standard-A", "te-IN"),
+        "gu": ("gu-IN-Standard-A", "gu-IN"),
+        "kn": ("kn-IN-Standard-A", "kn-IN"),
+        "ml": ("ml-IN-Standard-A", "ml-IN"),
+        "pa": ("pa-IN-Standard-A", "pa-IN"),
+        "es": ("es-ES-Standard-A", "es-ES"),
+        "fr": ("fr-FR-Standard-A", "fr-FR"),
+        "de": ("de-DE-Standard-A", "de-DE"),
+        "pt": ("pt-BR-Standard-A", "pt-BR"),
+        "it": ("it-IT-Standard-A", "it-IT"),
+        "ja": ("ja-JP-Standard-B", "ja-JP"),
+        "ko": ("ko-KR-Standard-A", "ko-KR"),
+        "zh-cn": ("cmn-CN-Standard-A", "cmn-CN"),
+        "zh-tw": ("cmn-TW-Standard-A", "cmn-TW"),
+        "ar": ("ar-XA-Standard-A", "ar-XA"),
+        "ru": ("ru-RU-Standard-A", "ru-RU"),
+    }
+
+    SYSTEM_PROMPT = """You are Jarvis, an intelligent AI assistant in a professional Google Meet call.
+
+YOUR NAME: Your name is Jarvis. When users address you as "Jarvis", they are calling you - it's NOT part of their question.
+
+INSTRUCTIONS:
+- Respond in the SAME language as the user speaks
+- Be professional, helpful, and comprehensive
+- For complex questions, provide thorough explanations
+- For simple questions, keep it concise
+- Maintain conversation context
+- When users say "Jarvis" followed by a question, ignore "Jarvis" and answer only the question
+
+NEVER include:
+❌ URLs, links, web addresses, website names
+❌ Markdown formatting like [text](url)
+❌ Citations, references, or source attributions
+❌ Phrases like "according to X" or "source: Y"
+
+Provide natural, conversational responses in the user's language."""
+
     def __init__(self):
         """Initialize the pipeline with STT, LLM, and TTS clients."""
-        # OpenAI for STT and LLM
         self.openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        
-        # OpenRouter for Gemini LLM
+
         self.openrouter_client = AsyncOpenAI(
-            api_key=os.getenv("OPENROUTER_API_KEY"),
-            base_url="https://openrouter.ai/api/v1"
+            api_key=os.getenv("GROQ_API_KEY"),
+            base_url="https://api.groq.com/openai/v1"
         )
-        
-        # Google Cloud TTS
+
         self.tts_client = texttospeech.TextToSpeechClient.from_service_account_file(
             os.getenv("GOOGLE_CREDENTIALS_FILE")
         )
-        
-        # Conversation history for context
-        self.conversation_history = []
-        
+
         self.tts_audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=16000
+            sample_rate_hertz=16000,
+            # These settings help with smoother audio
+            speaking_rate=1.0,
+            pitch=0.0,
         )
-        
-        # Conversation history
-        # Conversation history
-        self.messages = [
-            {
-                "role": "system",
-                "content": """You are Jarvis, an intelligent AI assistant in a professional Google Meet call.
-                
-                YOUR NAME: Your name is Jarvis. When users address you as "Jarvis", they are calling you - it's NOT part of their question.
-                
-                INSTRUCTIONS:
-                - Respond in the SAME language as the user speaks
-                - Be professional, helpful, and comprehensive
-                - For complex questions, provide thorough explanations
-                - For simple questions, keep it concise
-                - When users say "Jarvis" followed by a question, ignore "Jarvis" and answer only the question
-                
-                NEVER include:
-                ❌ URLs, links, web addresses, website names
-                ❌ Markdown formatting like [text](url)
-                ❌ Citations, references, or source attributions
-                ❌ Phrases like "according to X" or "source: Y"
-                
-                Provide natural, conversational responses in the user's language."""
-            }
-        ]
-        
+
+        self.conversation_summary = ""
+        self._assistant_turns = 0
+        self._last_summarized_turn = 0
+        self._summary_task: Optional[asyncio.Task] = None
+        self._summary_lock = asyncio.Lock()
+
+        # Keep system prompt separate from conversation history
+        self.system_prompt = self.SYSTEM_PROMPT
+        # Only user/assistant messages in deque (last 6 messages = 3 turns)
+        self.messages: deque = deque(maxlen=6)
+
+        # Audio smoother for crossfading
+        self.audio_smoother = AudioSmoother(sample_rate=16000, crossfade_ms=30)
+
         logger.info("LiveKit pipeline initialized")
-    
-    async def transcribe_audio(self, audio_pcm: bytes, sample_rate: int = 16000) -> Optional[str]:
+
+    # ------------------------------------------------------------------
+    # Text Cleaning
+    # ------------------------------------------------------------------
+
+    def _clean_for_tts(self, text: str) -> str:
+        """Clean text for TTS synthesis."""
+        clean = strip_markdown(text)
+        clean = re.sub(r'https?://\S+', '', clean)
+        clean = re.sub(r'\b[\w-]+\.(com|org|net|io|dev|ai)\b', '', clean)
+        clean = re.sub(r'[*_~`#]', '', clean)
+        clean = re.sub(r'\s+', ' ', clean)
+        return clean.strip()
+
+    # ------------------------------------------------------------------
+    # Chunking Logic - Optimized for natural speech
+    # ------------------------------------------------------------------
+
+    def _find_split_point(self, text: str) -> Optional[int]:
         """
-        Transcribe audio using OpenAI Whisper.
+        Find the best point to split text for TTS.
+        Prioritizes complete sentences for natural flow.
+        """
+        length = len(text)
         
-        Args:
-            audio_pcm: Raw PCM audio bytes (16-bit, mono)
-            sample_rate: Audio sample rate
+        if length < self.MIN_CHUNK_LENGTH:
+            return None
+
+        # Only split if we have enough text
+        # Look for sentence endings first
+        sentence_endings = '.?!।。؟'
+        
+        # Find ALL sentence endings in the valid range
+        candidates = []
+        for i, char in enumerate(text):
+            if char in sentence_endings:
+                # Prefer splits closer to IDEAL_CHUNK_LENGTH
+                if self.MIN_CHUNK_LENGTH <= i + 1 <= self.MAX_CHUNK_LENGTH:
+                    candidates.append(i + 1)
+        
+        if candidates:
+            # Pick the one closest to ideal length
+            ideal = self.IDEAL_CHUNK_LENGTH
+            best = min(candidates, key=lambda x: abs(x - ideal))
+            return best
+
+        # If no sentence boundary found and we're at max, find any break
+        if length >= self.MAX_CHUNK_LENGTH:
+            # Try clause markers
+            for marker in [',', ';', ':', '—', '–', ' - ']:
+                idx = text.rfind(marker, self.MIN_CHUNK_LENGTH, self.MAX_CHUNK_LENGTH)
+                if idx > 0:
+                    return idx + 1
             
-        Returns:
-            Transcribed text or None if no speech detected
-        """
+            # Fall back to word boundary
+            idx = text.rfind(' ', self.MIN_CHUNK_LENGTH, self.MAX_CHUNK_LENGTH)
+            if idx > 0:
+                return idx + 1
+            
+            # Last resort: hard cut
+            return self.MAX_CHUNK_LENGTH
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Voice Selection
+    # ------------------------------------------------------------------
+
+    def _select_voice_for_language(self, language_code: str) -> tuple[str, str]:
+        """Resolve TTS voice for a given language."""
+        if language_code in self.VOICE_MAP:
+            return self.VOICE_MAP[language_code]
+
+        base_lang = language_code.split("-")[0]
+        if base_lang in self.VOICE_MAP:
+            return self.VOICE_MAP[base_lang]
+
+        logger.warning(f"⚠️ No voice for '{language_code}', using English")
+        return ("en-IN-Standard-A", "en-IN")
+
+    def _detect_language(self, text: str) -> str:
+        """Detect language from text."""
         try:
-            # Convert PCM to WAV format for Whisper API
+            detected = detect(text)
+            if detected == "zh":
+                detected = "zh-cn"
+            return detected if detected in self.SUPPORTED_LANGUAGES else "en"
+        except LangDetectException:
+            return "en"
+
+    # ------------------------------------------------------------------
+    # STT
+    # ------------------------------------------------------------------
+
+    async def transcribe_audio(self, audio_pcm: bytes, sample_rate: int = 16000) -> Optional[str]:
+        """Transcribe audio using OpenAI Whisper."""
+        try:
             wav_buffer = io.BytesIO()
             with wave.open(wav_buffer, 'wb') as wav_file:
-                wav_file.setnchannels(1)  # Mono
-                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
                 wav_file.setframerate(sample_rate)
                 wav_file.writeframes(audio_pcm)
-            
+
             wav_buffer.seek(0)
             wav_buffer.name = "audio.wav"
-            
-            # Call Whisper API
+
             transcript = await self.openai_client.audio.transcriptions.create(
-                model="gpt-4o-transcribe",           
+                model="gpt-4o-transcribe",
                 file=wav_buffer,
-                
             )
-            
+
             text = transcript.text.strip()
-            
             if text:
                 logger.info(f"🎤 STT: '{text}'")
                 return text
-            
+
             return None
-            
+
         except Exception as e:
             logger.error(f"STT error: {e}", exc_info=True)
             return None
-    
+
+    # ------------------------------------------------------------------
+    # LLM
+    # ------------------------------------------------------------------
+
     async def generate_response(self, user_text: str) -> str:
-        """
-        Generate LLM response using Gemini via OpenRouter.
-        
-        Args:
-            user_text: User's transcribed text
-            
-        Returns:
-            LLM response text
-        """
+        """Generate LLM response (non-streaming)."""
         try:
-            # Add user message to history
-            self.messages.append({
-                "role": "user",
-                "content": user_text
-            })
-            
-            # Call Gemini via OpenRouter with highest throughput routing
+            self.messages.append({"role": "user", "content": user_text})
+
+            # Build messages: system prompt + chat history
+            api_messages = [{"role": "system", "content": self.system_prompt}]
+            api_messages.extend(list(self.messages))
+
             response = await self.openrouter_client.chat.completions.create(
                 model="meta-llama/llama-3.3-70b-instruct",
-                messages=self.messages,
+                messages=api_messages,
                 max_tokens=500,
                 temperature=0.7,
-                extra_body={
-                    "provider": {
-                        "sort": "throughput"
-                    }
-                }
             )
-            
+
             assistant_text = response.choices[0].message.content.strip()
-            
-            # CRITICAL: Strip ALL markdown formatting before speaking
-            clean_text = strip_markdown(assistant_text)
-            
-            # Remove any remaining URLs
-            clean_text = re.sub(r'https?://\S+', '', clean_text)
-            # Remove website mentions like "accuweather.com"
-            clean_text = re.sub(r'\b[a-zA-Z0-9-]+\.(com|org|net|io|dev|ai)\b', '', clean_text)
-            # Clean up extra spaces
-            clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-            
-            # Add CLEANED response to history (so future context is clean)
-            self.messages.append({
-                "role": "assistant",
-                "content": clean_text
-            })
-            
-            # Keep conversation history manageable (last 6 messages for faster processing)
-            if len(self.messages) > 7:  # system + 6 messages
-                self.messages = [self.messages[0]] + self.messages[-6:]
-            
-            logger.info(f"🤖 LLM (raw): '{assistant_text}'")
-            if clean_text != assistant_text:
-                logger.info(f"🤖 LLM (cleaned): '{clean_text}'")
-            
+            clean_text = self._clean_for_tts(assistant_text)
+
+            self.messages.append({"role": "assistant", "content": clean_text})
+
+            logger.info(f"🤖 LLM: '{clean_text[:100]}...'")
             return clean_text
-            
+
         except Exception as e:
             logger.error(f"LLM error: {e}", exc_info=True)
             return "I'm sorry, I encountered an error processing your request."
-        
-    async def generate_response_streaming(self, user_text: str):
-        """Stream LLM response and yield chunks for TTS with language detection."""
-        import time
-        
-        func_start = time.time()
-        logger.info(f"📥 generate_response_streaming called at {func_start}")
-        
-        # Add user message to conversation history
-        self.conversation_history.append({"role": "user", "content": user_text})
-        
-        # Build messages: system prompt + conversation history
-        messages = self.messages.copy()  # Start with system prompt
-        messages.extend(self.conversation_history)  # Add all conversation
-        
-        # Trim old messages if too long (keep system + last 6 messages)
-        if len(messages) > 7:
-            messages = [messages[0]] + messages[-6:]
-        
-        prep_done = time.time()
-        logger.info(f"⏱️ Message prep took {prep_done - func_start:.3f}s")
-        
-        # Enable streaming with highest throughput routing
-        logger.info("🚀 Calling OpenRouter API NOW...")
-        api_call_start = time.time()
-        
-        stream = await self.openrouter_client.chat.completions.create(
-            model="meta-llama/llama-3.3-70b-instruct:online",
-            messages=messages,
-            max_tokens=500,
-            temperature=0.7,
-            stream=True,
-            extra_body={
-                "provider": {
-                    "sort": "throughput"
-                }
-            }
-        )
-        
-        api_call_end = time.time()
-        logger.info(f"⏱️ API call setup took {api_call_end - api_call_start:.3f}s")
-        
-        full_response = ""
-        
-        first_chunk = True
-        async for chunk in stream:
-            if first_chunk:
-                first_chunk_time = time.time()
-                logger.info(f"⏱️ First chunk received after {first_chunk_time - api_call_start:.3f}s")
-                first_chunk = False
-                
-            if chunk.choices[0].delta.content:
-                token = chunk.choices[0].delta.content
-                full_response += token
-        
-        stream_done = time.time()
-        logger.info(f"⏱️ Full stream received in {stream_done - api_call_start:.3f}s")
-        
-        # Detect language using langdetect
-        from langdetect import detect, LangDetectException
-        
+
+    # ------------------------------------------------------------------
+    # TTS
+    # ------------------------------------------------------------------
+
+    async def synthesize_speech(self, text: str, language: str, voice: str) -> bytes:
+        """Convert text to speech using Google Cloud TTS."""
         try:
-            detected_lang = detect(full_response)
-            
-            # langdetect sometimes returns 'zh' instead of 'zh-cn' or 'zh-tw'
-            # Default Chinese to simplified (zh-cn)
-            if detected_lang == 'zh':
-                detected_lang = 'zh-cn'
-            
-            # Check if detected language is supported in VOICE_MAP
-            # (defined in synthesize_speech method)
-            supported_languages = {
-                "en", "hi", "ur", "bn", "mr", "ta", "te", "gu", "kn", "ml", "pa",
-                "es", "fr", "de", "pt", "it", "ja", "ko", "zh-cn", "zh-tw", "ar", "ru"
-            }
-            
-            if detected_lang in supported_languages:
-                language_code = detected_lang
-            else:
-                # Unsupported language, default to English
-                logger.info(f"🌍 Detected unsupported language '{detected_lang}', using English")
-                language_code = "en"
-            
-            logger.info(f"🌍 Detected language: {language_code}")
-        except LangDetectException:
-            logger.warning("Could not detect language, defaulting to English")
-            language_code = "en"
-        
-        # Save to conversation history
-        self.conversation_history.append({"role": "assistant", "content": full_response})
-        
-        yield_time = time.time()
-        logger.info(f"⏱️ Total time in generate_response_streaming: {yield_time - func_start:.3f}s")
-        
-        # Yield response text with language code
-        yield {"text": full_response, "language": language_code}
-    
-    async def synthesize_speech(self, text: str, language: str = "en") -> bytes:
-        """
-        Convert text to speech using Google Cloud TTS with specified language.
-        
-        Args:
-            text: Text to synthesize
-            language: ISO 639-1 language code (from LLM detection)
-            
-        Returns:
-            PCM audio bytes (16-bit, mono, 16kHz)
-        """
-        try:
-            # Map language codes to Google Cloud TTS language codes and voices
-            VOICE_MAP = {
-                "en": ("en-IN-Standard-C", "en-IN"),
-                "hi": ("hi-IN-Standard-A", "hi-IN"),
-                "ur": ("ur-IN-Standard-A", "ur-IN"),
-                "bn": ("bn-IN-Standard-A", "bn-IN"),
-                "mr": ("mr-IN-Standard-A", "mr-IN"),
-                "ta": ("ta-IN-Standard-A", "ta-IN"),
-                "te": ("te-IN-Standard-A", "te-IN"),
-                "gu": ("gu-IN-Standard-A", "gu-IN"),
-                "kn": ("kn-IN-Standard-A", "kn-IN"),
-                "ml": ("ml-IN-Standard-A", "ml-IN"),
-                "pa": ("pa-IN-Standard-A", "pa-IN"),
-                "es": ("es-ES-Standard-A", "es-ES"),
-                "fr": ("fr-FR-Standard-A", "fr-FR"),
-                "de": ("de-DE-Standard-A", "de-DE"),
-                "pt": ("pt-BR-Standard-A", "pt-BR"),
-                "it": ("it-IT-Standard-A", "it-IT"),
-                "ja": ("ja-JP-Standard-B", "ja-JP"),
-                "ko": ("ko-KR-Standard-A", "ko-KR"),
-                "zh-cn": ("cmn-CN-Standard-A", "cmn-CN"),
-                "zh-tw": ("cmn-TW-Standard-A", "cmn-TW"),
-                "ar": ("ar-XA-Standard-A", "ar-XA"),
-                "ru": ("ru-RU-Standard-A", "ru-RU"),
-            }
-            
-            voice_name, language_code = VOICE_MAP.get(language, ("en-IN-Standard-C", "en-IN"))
-            
-            # Use specified voice
-            voice = texttospeech.VoiceSelectionParams(
-                language_code=language_code,
-                name=voice_name
+            voice_params = texttospeech.VoiceSelectionParams(
+                language_code=language,
+                name=voice
             )
-            
+
             synthesis_input = texttospeech.SynthesisInput(text=text)
-            
-            # Call TTS API
+
             response = self.tts_client.synthesize_speech(
                 input=synthesis_input,
-                voice=voice,
+                voice=voice_params,
                 audio_config=self.tts_audio_config
             )
-            
-            logger.info(f"🔊 TTS: Generated {len(response.audio_content)} bytes (lang: {language})")
-            
+
+            logger.debug(f"🔊 TTS: {len(response.audio_content)} bytes for {len(text)} chars")
             return response.audio_content
-            
+
         except Exception as e:
             logger.error(f"TTS error: {e}", exc_info=True)
-            # Return silence on error
-            return b'\x00' * 16000 * 2  # 1 second of silence
-    
+            return b'\x00' * 16000 * 2
+
+    # ------------------------------------------------------------------
+    # Summarization
+    # ------------------------------------------------------------------
+
+    async def _update_conversation_summary(self):
+        """Update conversation summary using summarization agent."""
+        async with self._summary_lock:
+            try:
+                full_conversation = "\n".join(
+                    f"{msg['role'].capitalize()}: {msg['content']}"
+                    for msg in self.messages
+                    if msg['role'] in {'user', 'assistant'}
+                )
+
+                logger.info("📝 Updating conversation summary...")
+                summary = await summarize_text(full_conversation)
+
+                if summary:
+                    self.conversation_summary += summary
+                    logger.info(f"📝 Summary updated")
+
+            except Exception as e:
+                logger.error(f"📝 Summary error: {e}", exc_info=True)
+
+    def _schedule_summary_update(self):
+        """Schedule background summary update."""
+        if self._summary_task and not self._summary_task.done():
+            return
+        self._summary_task = asyncio.create_task(self._update_conversation_summary())
+
+    # ------------------------------------------------------------------
+    # Full Pipeline (Non-streaming)
+    # ------------------------------------------------------------------
+
     async def process_audio(self, audio_pcm: bytes, sample_rate: int = 16000) -> Optional[bytes]:
-        """
-        Full pipeline: Audio → STT → LLM → TTS → Audio
-        
-        Args:
-            audio_pcm: Input audio PCM bytes
-            sample_rate: Audio sample rate
-            
-        Returns:
-            Response audio PCM bytes or None if no speech detected
-        """
-        # Step 1: STT
+        """Full pipeline: Audio → STT → LLM → TTS → Audio"""
         text = await self.transcribe_audio(audio_pcm, sample_rate)
-        
         if not text:
             return None
-        
-        # Step 2: LLM
+
         response_text = await self.generate_response(text)
-        
-        # Step 3: TTS
-        response_audio = await self.synthesize_speech(response_text)
-        
-        return response_audio
-    
-    async def process_audio_streaming(self, audio_pcm: bytes, sample_rate: int = 16000):
-        """
-        STREAMING pipeline: Audio → STT → LLM (streaming) → TTS (per chunk) → Audio chunks
-        
-        Args:
-            audio_pcm: Input audio PCM bytes
-            sample_rate: Audio sample rate
-            
-        Yields:
-            Audio PCM chunks as they're generated
-        """
-        import time
-        
-        # Step 1: STT (still blocking, but fast with Whisper)
-        stt_start = time.time()
-        logger.info(f"🎙️ Starting STT for {len(audio_pcm)} bytes of audio")
+        language_code = self._detect_language(response_text)
+        voice_name, lang_code = self._select_voice_for_language(language_code)
+
+        return await self.synthesize_speech(response_text, lang_code, voice_name)
+
+    # ------------------------------------------------------------------
+    # Streaming Pipeline (from STT result)
+    # ------------------------------------------------------------------
+
+    async def process_audio_streaming(self, audio_pcm: bytes, sample_rate: int = 16000) -> AsyncGenerator[bytes, None]:
+        """Streaming pipeline: Audio → STT → LLM streaming → TTS chunks"""
         text = await self.transcribe_audio(audio_pcm, sample_rate)
-        stt_end = time.time()
-        logger.info(f"⏱️ STT took {stt_end - stt_start:.2f}s")
-        
+
         if not text or len(text.strip()) < 2:
-            logger.warning(f"⚠️ No valid transcription (got: '{text}') - skipping")
+            logger.warning(f"⚠️ No valid transcription")
             return
-        
-        logger.info(f"🎙️ STT successful: '{text[:50]}...'")
-        
-        # Step 2 & 3: Stream LLM → TTS
-        # Get response with language detection from LLM
-        logger.info("🔄 Calling generate_response_streaming...")
-        llm_start = time.time()
-        
-        async for response_data in self.generate_response_streaming(text):
-            llm_end = time.time()
-            logger.info(f"⏱️ Time from STT end to first LLM yield: {llm_end - stt_end:.2f}s")
-            
-            response_text = response_data.get("text", "")
-            language_code = response_data.get("language", "en")
-            
-            if not response_text or len(response_text.strip()) < 2:
-                logger.warning(f"⚠️ Empty or too short response text: '{response_text}'")
-                continue
-            
-            # Clean ALL markdown formatting before TTS
-            clean_text = strip_markdown(response_text)
-            # Remove any remaining URLs
-            clean_text = re.sub(r'https?://\S+', '', clean_text)
-            # Remove website mentions
-            clean_text = re.sub(r'\b[a-zA-Z0-9-]+\.(com|org|net|io|dev|ai)\b', '', clean_text)
-            # Clean up extra spaces
-            clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-            
-            if not clean_text or len(clean_text) < 2:
-                logger.warning(f"⚠️ Text became empty after cleaning: '{response_text}'")
-                continue
-                
-            logger.info(f"📊 TTS chunk: {len(clean_text)} chars for '{clean_text[:100]}'")
-            
-            # Convert to speech with detected language
-            tts_start = time.time()
-            audio_chunk = await self.synthesize_speech(clean_text, language_code)
-            tts_end = time.time()
-            logger.info(f"⏱️ TTS took {tts_end - tts_start:.2f}s")
-            
-            if not audio_chunk or len(audio_chunk) < 1000:
-                logger.warning(f"⚠️ TTS produced empty/short audio ({len(audio_chunk) if audio_chunk else 0} bytes)")
-                continue
-                
+
+        async for audio_chunk in self.process_audio_streaming_active(text):
             yield audio_chunk
-    
-    async def process_audio_streaming_active(self, audio_pcm: bytes, sample_rate: int = 16000):
+
+    # ------------------------------------------------------------------
+    # Active Streaming Pipeline (with smooth audio)
+    # ------------------------------------------------------------------
+
+    async def process_audio_streaming_active(self, user_text: str) -> AsyncGenerator[bytes, None]:
         """
-        STREAMING pipeline for ACTIVE bot: Uses existing conversation_history 
-        (which already has the transcript from passive listening).
-        Only does LLM → TTS.
-        
-        Args:
-            audio_pcm: Input audio PCM bytes
-            sample_rate: Audio sample rate
-            
-        Yields:
-            Audio PCM chunks as they're generated
+        ACTIVE streaming pipeline with smooth audio.
+        Uses larger chunks + crossfading for natural flow.
         """
-        import time
+        logger.info(f"🎙️ ACTIVE user: '{user_text[:60]}...'")
+
+        # 1. Detect language and select voice ONCE
+        language_code = self._detect_language(user_text)
+        voice_name, language_code = self._select_voice_for_language(language_code)
+        logger.info(f"🌍 Language: {language_code}, Voice: {voice_name}")
+
+        # 2. Build message context: system prompt + chat history
+        self.messages.append({"role": "user", "content": user_text})
+
+        # Always start with system prompt, then add conversation history
+        messages = [{"role": "system", "content": self.system_prompt}]
+        messages.extend(list(self.messages))
         
-        # Get the last user message from conversation_history
-        if not self.conversation_history or self.conversation_history[-1]["role"] != "user":
-            logger.warning("⚠️ No user message in history - cannot process")
-            return
+        # Add summary context if available
+        if self.conversation_summary:
+            messages.append({
+                "role": "user",
+                "content": f"Previous conversation: {self.conversation_summary}\n\nCurrent query: {user_text}"
+            })
+
+        # 3. Open LLM stream
+        logger.info("🚀 Opening LLM stream")
+        llm_start = time.time()
+
+        stream = await self.openrouter_client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=messages,
+            stream=True,
+        )
+
+        # 4. Reset audio smoother for new utterance
+        self.audio_smoother.reset()
+
+        # 5. Stream tokens → larger chunks → TTS → crossfade
+        full_response = ""
+        buffer = ""
+        first_token = True
+        chunks_synthesized = 0
+
+        try:
+            async for chunk in stream:
+                if first_token:
+                    logger.info(f"⏱️ First token: {time.time() - llm_start:.3f}s")
+                    first_token = False
+
+                delta = chunk.choices[0].delta.content
+                if not delta:
+                    continue
+
+                full_response += delta
+                buffer += delta
+
+                clean_buffer = self._clean_for_tts(buffer)
+
+                # Check for split point (using larger thresholds now)
+                split_point = self._find_split_point(clean_buffer)
+
+                if split_point:
+                    chunk_text = clean_buffer[:split_point].strip()
+                    remaining = clean_buffer[split_point:].strip()
+
+                    if chunk_text and len(chunk_text) >= 10:
+                        audio_chunk = await self.synthesize_speech(
+                            text=chunk_text,
+                            language=language_code,
+                            voice=voice_name,
+                        )
+
+                        if audio_chunk and len(audio_chunk) > self.MIN_AUDIO_SIZE:
+                            # Apply crossfade smoothing
+                            smoothed = self.audio_smoother.process(audio_chunk)
+                            chunks_synthesized += 1
+                            logger.debug(f"🔊 Chunk {chunks_synthesized}: '{chunk_text[:50]}...'")
+                            yield smoothed
+
+                    buffer = remaining
+
+            # 6. Flush remaining buffer
+            if buffer.strip():
+                clean_remainder = self._clean_for_tts(buffer)
+
+                if clean_remainder and len(clean_remainder) >= 5:
+                    audio_chunk = await self.synthesize_speech(
+                        text=clean_remainder,
+                        language=language_code,
+                        voice=voice_name,
+                    )
+
+                    if audio_chunk and len(audio_chunk) > self.MIN_AUDIO_SIZE:
+                        smoothed = self.audio_smoother.process(audio_chunk)
+                        chunks_synthesized += 1
+                        yield smoothed
+
+            # Flush any remaining crossfade tail
+            tail = self.audio_smoother.flush()
+            if tail:
+                yield tail
+
+        except Exception:
+            logger.error("❌ ACTIVE streaming failed", exc_info=True)
+            raise
+
+        # 7. Save assistant response
+        clean_full = self._clean_for_tts(full_response)
+
+        if clean_full:
+            self.messages.append({"role": "assistant", "content": clean_full})
+            self._assistant_turns += 1
+
+            if self._assistant_turns - self._last_summarized_turn >= 6:
+                self._last_summarized_turn = self._assistant_turns
+                self._schedule_summary_update()
+
+        logger.info(f"✅ Complete: {chunks_synthesized} chunks in {time.time() - llm_start:.2f}s")
+
+    # ------------------------------------------------------------------
+    # Batch Mode - Collect full response then synthesize (smoothest)
+    # ------------------------------------------------------------------
+
+    async def process_audio_batch(self, user_text: str) -> AsyncGenerator[bytes, None]:
+        """
+        BATCH mode: Collect full LLM response, then synthesize in optimal chunks.
+        Higher latency but smoothest audio quality.
+        """
+        logger.info(f"🎙️ BATCH user: '{user_text[:60]}...'")
+
+        language_code = self._detect_language(user_text)
+        voice_name, language_code = self._select_voice_for_language(language_code)
+
+        self.messages.append({"role": "user", "content": user_text})
+
+        # System prompt + chat history
+        messages = [{"role": "system", "content": self.system_prompt}]
+        messages.extend(list(self.messages))
         
-        user_text = self.conversation_history[-1]["content"]
-        logger.info(f"🎙️ Processing existing transcript: '{user_text[:50]}...'")
-        
-        # Build messages: system prompt + current user message (even when history is disabled)
-        messages = self.messages.copy()  # Start with system prompt
-        # Add the current user message (always include this, even if history is disabled)
-        messages.append({"role": "user", "content": user_text})
-        # messages.extend(self.conversation_history)  # Add all conversation (last 6 messages) - COMMENTED OUT FOR TESTING
-        
-        # Stream LLM response
-        logger.info("🚀 Calling OpenRouter API...")
+        if self.conversation_summary:
+            messages.append({
+                "role": "user",
+                "content": f"Previous conversation: {self.conversation_summary}\n\nCurrent query: {user_text}"
+            })
+
+        # Collect full response
         llm_start = time.time()
         
         stream = await self.openrouter_client.chat.completions.create(
-            model="meta-llama/llama-3.3-70b-instruct:online",
+            model="openai/gpt-4o-mini",
             messages=messages,
-            max_tokens=500,
-            temperature=0.7,
             stream=True,
-            extra_body={
-                "provider": {
-                    "sort": "throughput"
-                }
-            }
         )
-        
+
         full_response = ""
+        first_token = True
         
-        first_chunk = True
         async for chunk in stream:
-            if first_chunk:
-                first_chunk_time = time.time()
-                logger.info(f"⏱️ First chunk received after {first_chunk_time - llm_start:.3f}s")
-                first_chunk = False
+            if first_token:
+                logger.info(f"⏱️ First token: {time.time() - llm_start:.3f}s")
+                first_token = False
                 
-            if chunk.choices[0].delta.content:
-                token = chunk.choices[0].delta.content
-                full_response += token
+            delta = chunk.choices[0].delta.content
+            if delta:
+                full_response += delta
+
+        logger.info(f"⏱️ Full response in: {time.time() - llm_start:.2f}s")
+
+        # Clean and split into optimal chunks
+        clean_response = self._clean_for_tts(full_response)
         
-        stream_done = time.time()
-        logger.info(f"⏱️ Full stream received in {stream_done - llm_start:.3f}s")
+        if not clean_response:
+            return
+
+        # Split into sentence-based chunks
+        chunks = self._split_into_sentences(clean_response)
         
-        # Detect language
-        try:
-            detected_lang = detect(full_response)
-            
-            if detected_lang == 'zh':
-                detected_lang = 'zh-cn'
-            
-            supported_languages = {
-                "en", "hi", "ur", "bn", "mr", "ta", "te", "gu", "kn", "ml", "pa",
-                "es", "fr", "de", "pt", "it", "ja", "ko", "zh-cn", "zh-tw", "ar", "ru"
-            }
-            
-            if detected_lang in supported_languages:
-                language_code = detected_lang
+        self.audio_smoother.reset()
+        
+        for i, chunk_text in enumerate(chunks):
+            if len(chunk_text) < 5:
+                continue
+                
+            audio_chunk = await self.synthesize_speech(
+                text=chunk_text,
+                language=language_code,
+                voice=voice_name,
+            )
+
+            if audio_chunk and len(audio_chunk) > self.MIN_AUDIO_SIZE:
+                smoothed = self.audio_smoother.process(audio_chunk)
+                logger.debug(f"🔊 Batch chunk {i+1}/{len(chunks)}")
+                yield smoothed
+
+        # Flush tail
+        tail = self.audio_smoother.flush()
+        if tail:
+            yield tail
+
+        # Save response
+        self.messages.append({"role": "assistant", "content": clean_response})
+        self._assistant_turns += 1
+
+        logger.info(f"✅ BATCH complete: {len(chunks)} chunks")
+
+    def _split_into_sentences(self, text: str) -> list[str]:
+        """Split text into sentences, combining short ones."""
+        # Split on sentence boundaries
+        parts = re.split(r'(?<=[.?!।。])\s+', text)
+        
+        chunks = []
+        current = ""
+        
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+                
+            if not current:
+                current = part
+            elif len(current) + len(part) + 1 < self.IDEAL_CHUNK_LENGTH:
+                # Combine short sentences
+                current += " " + part
             else:
-                logger.info(f"🌍 Detected unsupported language '{detected_lang}', using English")
-                language_code = "en"
+                if current:
+                    chunks.append(current)
+                current = part
+        
+        if current:
+            chunks.append(current)
+        
+        return chunks
+
+    # ------------------------------------------------------------------
+    # Concurrent Streaming (lowest latency, good smoothness)
+    # ------------------------------------------------------------------
+
+    async def process_audio_streaming_concurrent(self, user_text: str) -> AsyncGenerator[bytes, None]:
+        """
+        Concurrent streaming with producer-consumer pattern.
+        Good balance of latency and smoothness.
+        """
+        logger.info(f"🎙️ CONCURRENT user: '{user_text[:60]}...'")
+
+        language_code = self._detect_language(user_text)
+        voice_name, language_code = self._select_voice_for_language(language_code)
+
+        self.messages.append({"role": "user", "content": user_text})
+
+        # System prompt + chat history
+        messages = [{"role": "system", "content": self.system_prompt}]
+        messages.extend(list(self.messages))
+        
+        if self.conversation_summary:
+            messages.append({
+                "role": "user",
+                "content": f"Previous conversation: {self.conversation_summary}\n\nCurrent query: {user_text}"
+            })
+
+        text_queue: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=5)
+        audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=3)
+
+        full_response = ""
+        llm_start = time.time()
+
+        async def llm_producer():
+            nonlocal full_response
+            buffer = ""
+
+            try:
+                stream = await self.openrouter_client.chat.completions.create(
+                    model="openai/gpt-4o-mini",
+                    messages=messages,
+                    stream=True,
+                )
+
+                first_token = True
+                async for chunk in stream:
+                    if first_token:
+                        logger.info(f"⏱️ First token: {time.time() - llm_start:.3f}s")
+                        first_token = False
+
+                    delta = chunk.choices[0].delta.content
+                    if not delta:
+                        continue
+
+                    full_response += delta
+                    buffer += delta
+                    clean = self._clean_for_tts(buffer)
+
+                    split_point = self._find_split_point(clean)
+                    if split_point:
+                        await text_queue.put(clean[:split_point].strip())
+                        buffer = clean[split_point:]
+
+                if buffer.strip():
+                    clean = self._clean_for_tts(buffer)
+                    if clean:
+                        await text_queue.put(clean)
+
+            except Exception as e:
+                logger.error(f"❌ LLM producer error: {e}")
+            finally:
+                await text_queue.put(None)
+
+        async def tts_consumer():
+            smoother = AudioSmoother(sample_rate=16000, crossfade_ms=30)
             
-            logger.info(f"🌍 Detected language: {language_code}")
-        except LangDetectException:
-            logger.warning("Could not detect language, defaulting to English")
-            language_code = "en"
-        
-        # Save to conversation history
-        self.conversation_history.append({"role": "assistant", "content": full_response})
-        
-        # Clean ALL markdown formatting before TTS
-        clean_text = strip_markdown(full_response)
-        # Remove any remaining URLs
-        clean_text = re.sub(r'https?://\S+', '', clean_text)
-        # Remove website mentions
-        clean_text = re.sub(r'\b[a-zA-Z0-9-]+\.(com|org|net|io|dev|ai)\b', '', clean_text)
-        # Clean up extra spaces
-        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-        
-        if not clean_text or len(clean_text) < 2:
-            logger.warning(f"⚠️ Text became empty after cleaning: '{full_response}'")
-            return
-            
-        logger.info(f"📊 TTS: {len(clean_text)} chars for '{clean_text[:100]}'")
-        
-        # Convert to speech with detected language
-        tts_start = time.time()
-        audio_chunk = await self.synthesize_speech(clean_text, language_code)
-        tts_end = time.time()
-        logger.info(f"⏱️ TTS took {tts_end - tts_start:.2f}s")
-        
-        if not audio_chunk or len(audio_chunk) < 1000:
-            logger.warning(f"⚠️ TTS produced empty/short audio ({len(audio_chunk) if audio_chunk else 0} bytes)")
-            return
-            
-        yield audio_chunk
+            try:
+                while True:
+                    text = await text_queue.get()
+                    if text is None:
+                        break
+
+                    if len(text) < 5:
+                        continue
+
+                    try:
+                        audio = await self.synthesize_speech(
+                            text=text,
+                            language=language_code,
+                            voice=voice_name,
+                        )
+
+                        if audio and len(audio) > self.MIN_AUDIO_SIZE:
+                            smoothed = smoother.process(audio)
+                            await audio_queue.put(smoothed)
+
+                    except Exception as e:
+                        logger.warning(f"⚠️ TTS error: {e}")
+
+                # Flush smoother
+                tail = smoother.flush()
+                if tail:
+                    await audio_queue.put(tail)
+
+            except Exception as e:
+                logger.error(f"❌ TTS consumer error: {e}")
+            finally:
+                await audio_queue.put(None)
+
+        producer_task = asyncio.create_task(llm_producer())
+        consumer_task = asyncio.create_task(tts_consumer())
+
+        try:
+            while True:
+                audio = await audio_queue.get()
+                if audio is None:
+                    break
+                yield audio
+
+        finally:
+            await producer_task
+            await consumer_task
+
+        clean_full = self._clean_for_tts(full_response)
+        if clean_full:
+            self.messages.append({"role": "assistant", "content": clean_full})
+            self._assistant_turns += 1
+
+            if self._assistant_turns - self._last_summarized_turn >= 6:
+                self._last_summarized_turn = self._assistant_turns
+                self._schedule_summary_update()
+
+        logger.info(f"✅ CONCURRENT complete: {time.time() - llm_start:.2f}s")
